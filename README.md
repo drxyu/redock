@@ -1,71 +1,77 @@
 # redock
 
-**Unplug the monitors. Keep the layout.** Every window back on the right screen, in the right spot, with one command.
+**Listen up, Mac users with more than one monitor.**
 
-Running a Mac with two or three external displays? Then you know the drill. You undock for a meeting, come back, plug everything in, and macOS has dumped your windows onto one screen. Now you get to spend five minutes dragging Slack, your editors, the browser and a dozen terminals back where they belong. Every single time.
+You know the ritual. You yank the cable and run to a meeting. You come back, plug it all in again, and macOS greets you with a crime scene: every window you own crammed onto one screen, piled up like laundry. Slack is sitting on your editor. Your editor is sitting on three browsers. Your terminals are... somewhere.
 
-Two commands end that:
+So you drag. Window. By. Window. Back. Into. Place.
+
+Every. Single. Day.
+
+**Enough.** macOS forgot where your windows go. redock didn't.
 
 ```sh
 save-windows office      # before you unplug
-restore-windows office   # after you plug back in
+restore-windows office   # after you plug back in. Boom. Done.
 ```
 
-Keep a layout for every desk you work at (`home`, `office`, `studio`) and switch between them in one go. Run `restore-windows` on its own to pick a layout from a menu.
+That's the whole trick. Every window jumps back to the screen it came from, at the exact size and spot you left it.
 
-- **No app to install.** No menu-bar icon, no background process, no subscription. Two small shell scripts that run on what every Mac already has.
-- **The right window, not just any window.** It tracks the window numbers macOS itself assigns, so each of your three Chrome windows goes back to its own spot.
-- **No guessing.** A window it cannot identify for certain is reported and left alone, never shuffled somewhere random.
+## Why you'll love it (besides the hours of your life you get back)
 
-Author: drxyu (https://github.com/drxyu). License: MIT, see [LICENSE](LICENSE).
+- **Zero apps. Zero menu-bar clutter. Zero subscriptions.** Two tiny shell scripts running on stuff your Mac already has. No "Pro" tier. No trial that expires on a Tuesday.
+- **It knows which Chrome window is which.** redock tracks the window numbers macOS itself hands out, so your three Chrome windows stop playing musical chairs.
+- **It doesn't guess.** Can't tell for sure which window is which? It says so and leaves that window alone. No random reshuffles, ever.
+- **One layout per desk.** `home`, `office`, `that-coffee-shop-with-the-ultrawide`. Save them all, restore whichever one you're sitting at.
+- **Too lazy to type a name?** Respect. Run `restore-windows` and pick one from a menu with the arrow keys.
 
-## Install
+## Get it (30 seconds, tops)
 
 ```sh
 git clone https://github.com/drxyu/redock.git ~/redock
 echo 'export PATH="$HOME/redock:$PATH"' >> ~/.zshrc
 ```
 
-Open a new terminal. The first time you run a command, macOS needs Accessibility permission for your terminal app: System Settings > Privacy & Security > Accessibility. Add the app, switch it on, then quit and reopen it.
+Open a new terminal. The first time, macOS will ask for Accessibility permission for your terminal app (fair enough, we're about to fling its windows around): System Settings > Privacy & Security > Accessibility. Add your terminal, flip it on, then quit and reopen it.
 
-Requirements: macOS with the built-in `osascript` and `/bin/bash` (3.2 or newer). Nothing else.
+What you need: macOS, its built-in `osascript` and `/bin/bash`. Nothing to brew. Nothing to npm. Nothing to "just quickly configure".
 
-## Usage
+## The entire manual
 
 ```sh
 save-windows home        # save every window's place under the tag "home"
 save-windows             # list saved tags, newest first, with date and window count
 save-windows -l          # same as above
-save-windows -l home     # show the windows saved under "home"
-save-windows -d office   # delete the tag "office"
+save-windows -l home     # show exactly which windows "home" remembers
+save-windows -d office   # forget the tag "office"
 
-restore-windows home     # put the windows back as saved under "home"
+restore-windows home     # put everything back the way "home" remembers it
 restore-windows          # pick a tag from a menu
 ```
 
-In the menu, use up/down or j/k to move, Enter to restore, and q or Esc to cancel. Other keys are ignored.
+In the menu: up/down or j/k to move, Enter to restore, q or Esc to bail. Every other key is ignored, so a stray keypress won't fire off a restore.
 
-Tags may contain letters, digits, dot, dash and underscore, and must start with a letter or digit. Saving to an existing tag replaces it.
+Tags take letters, digits, dot, dash and underscore, and start with a letter or digit. Saving to a tag that already exists overwrites it. No "are you sure?" pop-up, you're an adult.
 
-## How it works
+## How the magic works (spoiler: it's not magic)
 
-- `save-windows` records each window's app, title, position, size and macOS window number.
-- `restore-windows` finds each window by its window number first, then confirms the move actually landed on that window. Windows that were closed and reopened since the save are matched by exact title only. Anything it cannot match is reported as not placed and left where it is.
-- Both scripts print one line per window, so you can see what was saved, moved or skipped.
+- `save-windows` writes down each window's app, title, position, size and the window number macOS gave it.
+- `restore-windows` hunts each window down by that number, moves it, and checks the move actually landed on that exact window. Closed and reopened a window since you saved? Then it's matched by exact title only. Anything it can't pin down is reported as not placed and left right where it is.
+- Both commands print one line per window, so you see exactly what got saved, moved or skipped. No black box.
 
-## Files
+## Where your layouts live
 
-- Layouts are stored as `~/.window-layouts/<tag>.json`. Set `WINDOW_LAYOUT_DIR` to use another folder.
-- An older single layout at `~/.window-layout.json` is moved to the tag `default` the first time either script runs.
+- Each layout is one small file: `~/.window-layouts/<tag>.json`. Set `WINDOW_LAYOUT_DIR` to keep them somewhere else.
+- Still have an old single layout at `~/.window-layout.json`? It gets moved to the tag `default` the first time either command runs. Nothing lost.
 
-## Troubleshooting
+## When things go sideways
 
-- "Accessibility permission is missing": grant it to the terminal app as described under Install, then quit and reopen that app.
-- Windows reported as not placed: the window was closed, or its title changed since the save. Save again while the window is open.
-- A window lands somewhere unexpected: the displays may be arranged differently from when you saved. Save a separate tag for each arrangement.
+- **"Accessibility permission is missing"**: give your terminal app the permission described under Get it, then quit and reopen the app. Yes, fully quit.
+- **Some windows "not placed"**: they were closed, or their title changed since you saved. Save again while they're open.
+- **A window lands somewhere weird**: your displays are probably arranged differently than when you saved. Save one tag per arrangement and stop fighting it.
 
-## Disclaimer
+## The fine print (yes, we have to)
 
-These scripts move and resize windows on your screen through macOS Accessibility. They are provided as is, without warranty of any kind. You use them at your own risk. The author is not responsible for lost work, misplaced windows, data loss or any other damage arising from their use. Review the scripts before running them, and save your work first.
+redock moves and resizes windows on your screen through macOS Accessibility. It comes as is, without warranty of any kind. You use it at your own risk. The author is not responsible for lost work, misplaced windows, data loss or any other damage arising from its use. Read the scripts before you run them (they're short, promise), and save your work first.
 
-See [LICENSE](LICENSE) for the full terms.
+Made by [drxyu](https://github.com/drxyu). MIT licensed, full legalese in [LICENSE](LICENSE).
