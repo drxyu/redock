@@ -13,7 +13,7 @@
 #
 # Author:    drxyu (https://github.com/drxyu)
 # Copyright: (c) 2026 drxyu
-# License:   MIT, see LICENSE in this folder. Provided as is, without warranty.
+# License:   MIT, https://github.com/drxyu/redock. Provided as is, without warranty.
 
 set -euo pipefail
 
@@ -159,7 +159,8 @@ function run(argv) {
   const byApp = {}
   for (const entry of saved) (byApp[entry.app] ||= []).push(entry)
 
-  let moved = 0, missed = 0, denied = false
+  let moved = 0, missed = 0, denied = false, automation = false
+  const blocked = e => e.errorNumber === -1743 || /not authori[sz]ed to send apple events/i.test(String(e.message))
 
   // Current bounds of a window number, or null once that window is closed.
   function cgBounds(num) {
@@ -185,6 +186,7 @@ function run(argv) {
       windows = se.applicationProcesses.byName(appName).windows()
     } catch (e) {
       if (/assistive access/i.test(e.message)) denied = true
+      if (blocked(e)) automation = true
       missed += byApp[appName].length
       continue
     }
@@ -252,6 +254,7 @@ function run(argv) {
     }
   }
 
+  if (automation) return 'AUTOMATION'
   return denied ? 'DENIED' : `restored ${moved} windows, ${missed} could not be placed`
 }
 JXA
@@ -260,6 +263,15 @@ JXA
 case "$RESULT" in
   EMPTY)
     printf 'tag "%s" is empty - run save-windows %s while the displays are connected\n' "$TAG" "$TAG" >&2
+    exit 1 ;;
+  AUTOMATION)
+    cat >&2 <<'MSG'
+macOS is blocking this terminal from controlling System Events, so no windows could be moved.
+
+Allow it:
+  System Settings > Privacy & Security > Automation > your terminal app > turn on System Events
+Then try again.
+MSG
     exit 1 ;;
   DENIED)
     cat >&2 <<'MSG'

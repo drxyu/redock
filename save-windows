@@ -16,7 +16,7 @@
 #
 # Author:    drxyu (https://github.com/drxyu)
 # Copyright: (c) 2026 drxyu
-# License:   MIT, see LICENSE in this folder. Provided as is, without warranty.
+# License:   MIT, https://github.com/drxyu/redock. Provided as is, without warranty.
 
 set -euo pipefail
 
@@ -136,7 +136,8 @@ ObjC.import('CoreGraphics')
 
 const se = Application('System Events')
 const out = []
-let denied = false
+let denied = false, automation = false
+const blocked = e => e.errorNumber === -1743 || /not authori[sz]ed to send apple events/i.test(String(e.message))
 
 // Window numbers never change while a window is open; pair them with the AX windows by pid + bounds.
 function windowTable() {
@@ -155,7 +156,15 @@ function windowTable() {
 const table = windowTable()
 const assigned = new Set()
 
-for (const proc of se.applicationProcesses.whose({ backgroundOnly: false })()) {
+let procs = []
+try {
+  procs = se.applicationProcesses.whose({ backgroundOnly: false })()
+} catch (e) {
+  if (!blocked(e)) throw e
+  automation = true
+}
+
+for (const proc of procs) {
   let appName, pid
   try { appName = proc.name(); pid = proc.unixId() } catch (e) { continue }
 
@@ -164,6 +173,7 @@ for (const proc of se.applicationProcesses.whose({ backgroundOnly: false })()) {
     windows = proc.windows()
   } catch (e) {
     if (/assistive access/i.test(e.message)) denied = true
+    if (blocked(e)) automation = true
     continue
   }
 
@@ -183,8 +193,19 @@ for (const proc of se.applicationProcesses.whose({ backgroundOnly: false })()) {
   })
 }
 
-JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, windows: out }, null, 2)
+JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, automation: automation, windows: out }, null, 2)
 JXA
+
+if /usr/bin/grep -q '"automation": true' "$TMP"; then
+  cat >&2 <<'MSG'
+macOS is blocking this terminal from controlling System Events, so no windows could be read.
+
+Allow it:
+  System Settings > Privacy & Security > Automation > your terminal app > turn on System Events
+Then try again.
+MSG
+  exit 1
+fi
 
 if /usr/bin/grep -q '"denied": true' "$TMP"; then
   cat >&2 <<'MSG'
