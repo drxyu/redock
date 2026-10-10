@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# restore-windows
+#
+# Puts every window recorded by save-windows under a tag back where it was. Match
+# is by the macOS window number recorded at save time; a window that no longer
+# exists is matched by its exact title or reported as not placed.
+#
+#   restore-windows tag    restore that tag
+#   restore-windows        pick a tag from a menu (up/down, Enter, q)
+#
+# Needs Accessibility permission for whichever terminal runs it.
+#
+# Author:    drxyu (https://github.com/drxyu)
+# Copyright: (c) 2026 drxyu
+# License:   MIT, see LICENSE in this folder. Provided as is, without warranty.
+
+set -euo pipefail
+
+DIR="${WINDOW_LAYOUT_DIR:-$HOME/.window-layouts}"
+LEGACY="$HOME/.window-layout.json"
+TAG_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+usage() {
+  cat <<'USAGE'
+usage: restore-windows [tag]  restore the windows saved under tag; no tag shows a menu
+USAGE
+}
+
+migrate_legacy() {
+  [[ -f "$LEGACY" && ! -e "$DIR/default.json" ]] || return 0
+  mkdir -p -m 700 "$DIR"
+  mv "$LEGACY" "$DIR/default.json"
+  printf 'moved %s to tag "default"\n' "$LEGACY" >&2
+}
+
+load_tags() {
+  TAGS=()
+  local f
+  while IFS= read -r f; do if [[ -f "$f" ]]; then TAGS+=("$(basename "$f" .json)"); fi; done < <(ls -td "$DIR"/*.json 2>/dev/null)
+  WIDTH=0
+  for f in ${TAGS[@]+"${TAGS[@]}"}; do if [[ ${#f} -gt $WIDTH ]]; then WIDTH=${#f}; fi; done
+}
+
+describe() {
+  printf '%-*s  saved %s  %s windows' "$WIDTH" "$1" \
+    "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$1.json")" "$(/usr/bin/grep -c '"app"' "$DIR/$1.json" || true)"
+}
+
+list_tags() {
+  local t
+  for t in "${TAGS[@]}"; do printf '  %s\n' "$(describe "$t")"; done
+}
+
+# Sets KEY to up, down, enter, q, the typed character, or "" for anything to ignore.
+read_key() {
+  local c seq=""
+  KEY=""
+  IFS= read -rsn1 -d '' c </dev/tty || { KEY=q; return 0; }
+  case "$c" in
+    $'\n'|$'\r') KEY=enter ;;
+    $'\033')
+      if ! IFS= read -rsn1 -d '' -t 1 c </dev/tty; then KEY=q; return 0; fi
+      # Consume the whole sequence so keys like PgUp (ESC [ 5 ~) leave no bytes behind.
+      case "$c" in
+        '[') while IFS= read -rsn1 -d '' -t 1 c </dev/tty; do seq+="$c"; [[ "$c" == [0-9\;] ]] || break; done ;;
+        O) IFS= read -rsn1 -d '' -t 1 seq </dev/tty || true ;;
+        *) KEY=q; return 0 ;;
+      esac
+      case "$seq" in A) KEY=up ;; B) KEY=down ;; esac ;;
+    *) KEY="$c" ;;
+  esac
+}
+
+pick_tag() {
+  local n=${#TAGS[@]} sel=0 i cols avail drawn=0 hint="up/down move, Enter restore, q cancel"
+  local -a desc=()
+  for ((i = 0; i < n; i++)); do desc[i]="$(describe "${TAGS[$i]}")"; done
+  SAVED_TTY="$(stty -g </dev/tty)"
+  trap 'stty "$SAVED_TTY" </dev/tty 2>/dev/null; printf "\033[?25h" >/dev/tty' EXIT
+  trap 'exit 130' INT TERM
+  trap 'exit 131' QUIT
+  trap '' TSTP
+  stty -echo -icanon </dev/tty
+  printf 'Restore which layout?\n\n\033[?25l' >/dev/tty
+  while true; do
+    cols="$(stty size </dev/tty)"; cols="${cols#* }"
+    [[ "$cols" =~ ^[0-9]+$ && $cols -gt 0 ]] || cols=80
+    avail=$(( cols > 15 ? cols - 5 : 10 ))
+    if [[ $drawn -eq 1 ]]; then printf '\033[%dA' $((n + 2)) >/dev/tty; fi
+    drawn=1
+    for ((i = 0; i < n; i++)); do
+      if [[ $i -eq $sel ]]; then
+        printf '  \033[1m> %s\033[0m\033[K\n' "${desc[i]:0:avail}" >/dev/tty
+      else
+        printf '    %s\033[K\n' "${desc[i]:0:avail}" >/dev/tty
+      fi
+    done
+    printf "\033[K\n  %s\033[K\n" "${hint:0:avail}" >/dev/tty
+
+    read_key
+    case "$KEY" in
+      up|k) sel=$(( (sel + n - 1) % n )) ;;
+      down|j) sel=$(( (sel + 1) % n )) ;;
+      q|Q) printf 'nothing restored\n' >&2; exit 0 ;;
+      enter) break ;;
+    esac
+  done
+  stty "$SAVED_TTY" </dev/tty
+  printf '\033[?25h' >/dev/tty
+  trap - EXIT INT TERM QUIT TSTP
+  TAG="${TAGS[$sel]}"
+}
+
+migrate_legacy
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -*) printf 'unknown option %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+[[ $# -le 1 ]] || { usage >&2; exit 2; }
+
+load_tags
+if [[ ${#TAGS[@]} -eq 0 ]]; then
+  printf 'no saved layouts in %s - run save-windows <tag> first\n' "$DIR" >&2
+  exit 1
+fi
+
+if [[ $# -eq 1 ]]; then
+  TAG="$1"
+  if ! [[ "$TAG" =~ $TAG_RE && -f "$DIR/$TAG.json" ]]; then
+    printf 'no saved layout tagged "%s"; saved tags:\n' "$TAG" >&2
+    list_tags >&2
+    exit 1
+  fi
+elif { : </dev/tty; } 2>/dev/null; then
+  pick_tag
+else
+  printf 'no tag given and no terminal for the menu; saved tags:\n' >&2
+  list_tags >&2
+  exit 2
+fi
+
+LAYOUT="$DIR/$TAG.json"
+printf 'restoring tag "%s" (saved %s)\n' "$TAG" "$(stat -f '%Sm' -t '%b %d %H:%M' "$LAYOUT")" >&2
+
+RESULT="$(osascript -l JavaScript - "$LAYOUT" <<'JXA'
+ObjC.import('Foundation')
+ObjC.import('CoreGraphics')
+
+function run(argv) {
+  const raw = ObjC.unwrap(
+    $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null)
+  )
+  const saved = JSON.parse(raw).windows || []
+  if (saved.length === 0) return 'EMPTY'
+
+  const se = Application('System Events')
+  const byApp = {}
+  for (const entry of saved) (byApp[entry.app] ||= []).push(entry)
+
+  let moved = 0, missed = 0, denied = false
+
+  // Current bounds of a window number, or null once that window is closed.
+  function cgBounds(num) {
+    const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0x10, 0))
+    for (let i = 0; i < list.count; i++) {
+      const w = ObjC.deepUnwrap(list.objectAtIndex(i))
+      if (w.kCGWindowNumber !== num) continue
+      const b = w.kCGWindowBounds
+      return { x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) }
+    }
+    return null
+  }
+
+  const same = (a, b) => a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
+  const geom = w => { const p = w.position(), s = w.size(); return { x: p[0], y: p[1], w: s[0], h: s[1] } }
+  const place = (w, g) => { w.position = [g.x, g.y]; w.size = [g.w, g.h] }
+  const label = e => `${e.app} ${e.id == null ? '' : '#' + e.id + ' '}${JSON.stringify(e.title)}`
+  const where = g => `${g.x},${g.y} ${g.w}x${g.h}`
+
+  for (const appName of Object.keys(byApp)) {
+    let windows
+    try {
+      windows = se.applicationProcesses.byName(appName).windows()
+    } catch (e) {
+      if (/assistive access/i.test(e.message)) denied = true
+      missed += byApp[appName].length
+      continue
+    }
+
+    const taken = new Set()
+
+    for (const entry of byApp[appName]) {
+      const current = entry.id == null ? null : cgBounds(entry.id)
+
+      if (current) {
+        if (same(current, entry)) {
+          moved++
+          console.log(`placed ${label(entry)} already at ${where(entry)}`)
+          continue
+        }
+        // Several windows can share one spot after an unplug, so a move only counts once the
+        // window number itself is seen to leave it.
+        let verified = -1, candidates = 0
+        for (let i = 0; i < windows.length && verified === -1; i++) {
+          if (taken.has(i)) continue
+          let g
+          try { g = geom(windows[i]) } catch (e) { continue }
+          if (!same(g, current)) continue
+          candidates++
+          let ok = false
+          try {
+            place(windows[i], entry)
+            let after = cgBounds(entry.id)
+            if (after !== null && same(after, current)) { delay(0.05); after = cgBounds(entry.id) }
+            ok = after !== null && !same(after, current)
+          } catch (e) {}
+          if (ok) { verified = i; break }
+          try { place(windows[i], current) } catch (e) {}
+        }
+        if (verified === -1) {
+          missed++
+          console.log(`missed ${label(entry)} none of ${candidates} candidates at ${where(current)} verified`)
+          continue
+        }
+        taken.add(verified)
+        moved++
+        console.log(`placed ${label(entry)} -> ${where(entry)} [by id]`)
+        continue
+      }
+
+      // The window is gone or never had a number: exact title only, never its slot in the list.
+      const target = windows.findIndex((w, i) => {
+        if (taken.has(i)) return false
+        try { return entry.title !== null && w.name() === entry.title } catch (e) { return false }
+      })
+      if (target === -1) {
+        missed++
+        console.log(`missed ${label(entry)} ${entry.id == null ? 'no window number' : 'window closed'}, no exact title match`)
+        continue
+      }
+      try {
+        place(windows[target], entry)
+        taken.add(target)
+        moved++
+        console.log(`placed ${label(entry)} -> ${where(entry)} [by title]`)
+      } catch (e) {
+        missed++
+        console.log(`missed ${label(entry)} move failed: ${e.message}`)
+      }
+    }
+  }
+
+  return denied ? 'DENIED' : `restored ${moved} windows, ${missed} could not be placed`
+}
+JXA
+)"
+
+case "$RESULT" in
+  EMPTY)
+    printf 'tag "%s" is empty - run save-windows %s while the displays are connected\n' "$TAG" "$TAG" >&2
+    exit 1 ;;
+  DENIED)
+    cat >&2 <<'MSG'
+Accessibility permission is missing, so no windows could be moved.
+
+Grant it to the app running this shell:
+  System Settings > Privacy & Security > Accessibility > add and enable it
+Then quit that app fully and reopen it before trying again.
+MSG
+    exit 1 ;;
+  *)
+    printf '%s\n' "$RESULT" ;;
+esac

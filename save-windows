@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# save-windows
+#
+# Records the position, size and macOS window number of every open window under
+# a tag (home, office, ...) in ~/.window-layouts/<tag>.json, so restore-windows
+# can put them back after the external displays are replugged.
+#
+#   save-windows tag       save under tag
+#   save-windows           list saved tags, same as -l
+#   save-windows -l        list saved tags
+#   save-windows -l tag    show the windows saved under tag
+#   save-windows -d tag    delete a saved tag
+#
+# Needs Accessibility permission for whichever terminal runs it.
+#
+# Author:    drxyu (https://github.com/drxyu)
+# Copyright: (c) 2026 drxyu
+# License:   MIT, see LICENSE in this folder. Provided as is, without warranty.
+
+set -euo pipefail
+
+DIR="${WINDOW_LAYOUT_DIR:-$HOME/.window-layouts}"
+LEGACY="$HOME/.window-layout.json"
+TAG_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+usage() {
+  cat <<'USAGE'
+usage: save-windows tag       save every window's place under tag
+       save-windows           list saved tags, same as -l
+       save-windows -l        list saved tags
+       save-windows -l tag    show the windows saved under tag
+       save-windows -d tag    delete a saved tag
+USAGE
+}
+
+migrate_legacy() {
+  [[ -f "$LEGACY" && ! -e "$DIR/default.json" ]] || return 0
+  mkdir -p -m 700 "$DIR"
+  mv "$LEGACY" "$DIR/default.json"
+  printf 'moved %s to tag "default"\n' "$LEGACY" >&2
+}
+
+load_tags() {
+  TAGS=()
+  local f
+  while IFS= read -r f; do if [[ -f "$f" ]]; then TAGS+=("$(basename "$f" .json)"); fi; done < <(ls -td "$DIR"/*.json 2>/dev/null)
+}
+
+list_tags() {
+  load_tags
+  if [[ ${#TAGS[@]} -eq 0 ]]; then
+    printf 'no saved layouts in %s\n' "$DIR"
+    return 0
+  fi
+  local t width=0
+  for t in "${TAGS[@]}"; do if [[ ${#t} -gt $width ]]; then width=${#t}; fi; done
+  for t in "${TAGS[@]}"; do
+    printf '%-*s  saved %s  %s windows\n' "$width" "$t" \
+      "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$t.json")" "$(/usr/bin/grep -c '"app"' "$DIR/$t.json" || true)"
+  done
+}
+
+require_tag() {
+  if ! [[ "$1" =~ $TAG_RE && -f "$DIR/$1.json" ]]; then
+    printf 'no saved layout tagged "%s"\n' "$1" >&2
+    list_tags >&2
+    exit 1
+  fi
+}
+
+show_tag() {
+  require_tag "$1"
+  printf '%s windows in "%s", saved %s\n' "$(/usr/bin/grep -c '"app"' "$DIR/$1.json" || true)" "$1" \
+    "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$1.json")"
+  osascript -l JavaScript - "$DIR/$1.json" <<'JXA'
+ObjC.import('Foundation')
+
+function run(argv) {
+  const raw = ObjC.unwrap(
+    $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null)
+  )
+  const rows = JSON.parse(raw).windows || []
+  if (rows.length === 0) return 'the layout is empty - save-windows captured nothing'
+  const xs = rows.map(r => r.x)
+  const lines = [`x span: ${Math.min(...xs)} .. ${Math.max(...xs)}`, '']
+  rows.sort((a, b) => a.x - b.x || a.y - b.y).forEach(r => lines.push(
+    `  ${String(r.app || "").slice(0, 22).padEnd(22)} (${String(r.x).padStart(6)},${String(r.y).padStart(5)})  ` +
+    `${(r.w + 'x' + r.h).padEnd(11)} ${(r.title || '').slice(0, 44)}`))
+  return lines.join('\n')
+}
+JXA
+}
+
+delete_tag() {
+  require_tag "$1"
+  rm -f "$DIR/$1.json"
+  printf 'deleted tag "%s"\n' "$1"
+}
+
+migrate_legacy
+
+if [[ $# -eq 0 ]]; then
+  list_tags
+  exit 0
+fi
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+  -l|--list)
+    case $# in
+      1) list_tags ;;
+      2) show_tag "$2" ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    exit 0 ;;
+  -d|--delete)
+    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    delete_tag "$2"; exit 0 ;;
+  -*) printf 'unknown option %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+[[ $# -le 1 ]] || { usage >&2; exit 2; }
+TAG="$1"
+if ! [[ "$TAG" =~ $TAG_RE ]]; then
+  printf 'invalid tag "%s" - use letters, digits, dot, dash or underscore\n' "$TAG" >&2
+  exit 2
+fi
+LAYOUT="$DIR/$TAG.json"
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+osascript -l JavaScript <<'JXA' > "$TMP"
+ObjC.import('CoreGraphics')
+
+const se = Application('System Events')
+const out = []
+let denied = false
+
+// Window numbers never change while a window is open; pair them with the AX windows by pid + bounds.
+function windowTable() {
+  const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0x10, 0))
+  const rows = []
+  for (let i = 0; i < list.count; i++) {
+    const w = ObjC.deepUnwrap(list.objectAtIndex(i))
+    if (w.kCGWindowLayer !== 0) continue
+    const b = w.kCGWindowBounds
+    rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID,
+      x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) })
+  }
+  return rows
+}
+
+const table = windowTable()
+const assigned = new Set()
+
+for (const proc of se.applicationProcesses.whose({ backgroundOnly: false })()) {
+  let appName, pid
+  try { appName = proc.name(); pid = proc.unixId() } catch (e) { continue }
+
+  let windows
+  try {
+    windows = proc.windows()
+  } catch (e) {
+    if (/assistive access/i.test(e.message)) denied = true
+    continue
+  }
+
+  windows.forEach(w => {
+    try {
+      const pos = w.position()
+      const size = w.size()
+      if (!pos || !size) return
+      const title = (() => { try { return w.name() } catch (e) { return null } })()
+      const row = table.find(r => r.pid === pid && !assigned.has(r.num) &&
+        r.x === pos[0] && r.y === pos[1] && r.w === size[0] && r.h === size[1])
+      if (row) assigned.add(row.num)
+      const id = row ? row.num : null
+      out.push({ app: appName, id: id, title: title, x: pos[0], y: pos[1], w: size[0], h: size[1] })
+      console.log(`${appName} ${id === null ? '(no window number)' : '#' + id} ${JSON.stringify(title)} ${pos[0]},${pos[1]} ${size[0]}x${size[1]}`)
+    } catch (e) {}
+  })
+}
+
+JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, windows: out }, null, 2)
+JXA
+
+if /usr/bin/grep -q '"denied": true' "$TMP"; then
+  cat >&2 <<'MSG'
+Accessibility permission is missing, so no windows could be read.
+
+Grant it to the app running this shell:
+  System Settings > Privacy & Security > Accessibility > add and enable it
+Then quit that app fully and reopen it before trying again.
+MSG
+  exit 1
+fi
+
+REPLACED=""
+[[ -f "$LAYOUT" ]] && REPLACED=", replacing the previous one"
+mkdir -p -m 700 "$DIR"
+cp "$TMP" "$LAYOUT"
+printf 'saved %s windows as tag "%s" in %s%s\n' "$(/usr/bin/grep -c '"app"' "$LAYOUT" || true)" "$TAG" "$LAYOUT" "$REPLACED"
