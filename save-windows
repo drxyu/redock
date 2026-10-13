@@ -2,17 +2,20 @@
 #
 # save-windows
 #
-# Records the position, size and macOS window number of every open window under
-# a tag (home, office, ...) in ~/.window-layouts/<tag>.json, so restore-windows
-# can put them back after the external displays are replugged.
+# Records the position, size, desktop (macOS Space) and window number of every
+# open window under a tag (home, office, ...) in ~/.window-layouts/<tag>.json, so
+# restore-windows can put them back after the external displays are replugged.
+# Accessibility only lists the windows of the current desktop, so saving visits
+# every desktop that has windows and comes back to where it started.
 #
 #   save-windows tag       save under tag
-#   save-windows           list saved tags, same as -l
+#   save-windows           save under the tag "default"; the previous default is kept as default.bak-<date>
 #   save-windows -l        list saved tags
 #   save-windows -l tag    show the windows saved under tag
 #   save-windows -d tag    delete a saved tag
 #
-# Needs Accessibility permission for whichever terminal runs it.
+# Needs Accessibility permission for whichever terminal runs it, and Mission
+# Control's "Move left/right a space" shortcuts (on by default).
 #
 # Author:    drxyu (https://github.com/drxyu)
 # Copyright: (c) 2026 drxyu
@@ -26,8 +29,8 @@ TAG_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 usage() {
   cat <<'USAGE'
-usage: save-windows tag       save every window's place under tag
-       save-windows           list saved tags, same as -l
+usage: save-windows tag       save every window's desktop and place under tag
+       save-windows           same, under the tag "default"; the old default is kept as default.bak-<date>
        save-windows -l        list saved tags
        save-windows -l tag    show the windows saved under tag
        save-windows -d tag    delete a saved tag
@@ -47,6 +50,9 @@ load_tags() {
   while IFS= read -r f; do if [[ -f "$f" ]]; then TAGS+=("$(basename "$f" .json)"); fi; done < <(ls -td "$DIR"/*.json 2>/dev/null)
 }
 
+count_windows() { /usr/bin/grep -c '"app"' "$1" || true; }
+count_desktops() { /usr/bin/grep -oE '"desktop": [0-9]+' "$1" | sort -u | /usr/bin/grep -c . || true; }
+
 list_tags() {
   load_tags
   if [[ ${#TAGS[@]} -eq 0 ]]; then
@@ -56,8 +62,8 @@ list_tags() {
   local t width=0
   for t in "${TAGS[@]}"; do if [[ ${#t} -gt $width ]]; then width=${#t}; fi; done
   for t in "${TAGS[@]}"; do
-    printf '%-*s  saved %s  %s windows\n' "$width" "$t" \
-      "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$t.json")" "$(/usr/bin/grep -c '"app"' "$DIR/$t.json" || true)"
+    printf '%-*s  saved %s  %s windows on %s desktops\n' "$width" "$t" \
+      "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$t.json")" "$(count_windows "$DIR/$t.json")" "$(count_desktops "$DIR/$t.json")"
   done
 }
 
@@ -71,7 +77,7 @@ require_tag() {
 
 show_tag() {
   require_tag "$1"
-  printf '%s windows in "%s", saved %s\n' "$(/usr/bin/grep -c '"app"' "$DIR/$1.json" || true)" "$1" \
+  printf '%s windows on %s desktops in "%s", saved %s\n' "$(count_windows "$DIR/$1.json")" "$(count_desktops "$DIR/$1.json")" "$1" \
     "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$1.json")"
   osascript -l JavaScript - "$DIR/$1.json" <<'JXA'
 ObjC.import('Foundation')
@@ -84,8 +90,9 @@ function run(argv) {
   if (rows.length === 0) return 'the layout is empty - save-windows captured nothing'
   const xs = rows.map(r => r.x)
   const lines = [`x span: ${Math.min(...xs)} .. ${Math.max(...xs)}`, '']
-  rows.sort((a, b) => a.x - b.x || a.y - b.y).forEach(r => lines.push(
-    `  ${String(r.app || "").slice(0, 22).padEnd(22)} (${String(r.x).padStart(6)},${String(r.y).padStart(5)})  ` +
+  const desk = r => r.desktop == null ? 99 : r.desktop
+  rows.sort((a, b) => desk(a) - desk(b) || a.x - b.x || a.y - b.y).forEach(r => lines.push(
+    `  ${(r.desktop == null ? '-' : 'd' + r.desktop).padEnd(4)}${String(r.app || "").slice(0, 22).padEnd(22)} (${String(r.x).padStart(6)},${String(r.y).padStart(5)})  ` +
     `${(r.w + 'x' + r.h).padEnd(11)} ${(r.title || '').slice(0, 44)}`))
   return lines.join('\n')
 }
@@ -100,12 +107,7 @@ delete_tag() {
 
 migrate_legacy
 
-if [[ $# -eq 0 ]]; then
-  list_tags
-  exit 0
-fi
-
-case "$1" in
+case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   -l|--list)
     case $# in
@@ -121,7 +123,7 @@ case "$1" in
 esac
 
 [[ $# -le 1 ]] || { usage >&2; exit 2; }
-TAG="$1"
+TAG="${1:-default}"
 if ! [[ "$TAG" =~ $TAG_RE ]]; then
   printf 'invalid tag "%s" - use letters, digits, dot, dash or underscore\n' "$TAG" >&2
   exit 2
@@ -133,11 +135,65 @@ trap 'rm -f "$TMP"' EXIT
 
 osascript -l JavaScript <<'JXA' > "$TMP"
 ObjC.import('CoreGraphics')
+ObjC.bindFunction('CGSMainConnectionID', ['int', []])
+ObjC.bindFunction('CGSCopyManagedDisplaySpaces', ['id', ['int']])
+ObjC.bindFunction('CGSCopySpacesForWindows', ['id', ['int', 'int', 'id']])
+ObjC.bindFunction('CGSManagedDisplayGetCurrentSpace', ['unsigned long long', ['int', 'id']])
 
+const cid = $.CGSMainConnectionID()
 const se = Application('System Events')
 const out = []
-let denied = false, automation = false
+let denied = false, automation = false, switching = true
 const blocked = e => e.errorNumber === -1743 || /not authori[sz]ed to send apple events/i.test(String(e.message))
+
+// Every Space in Mission Control order; desktop is its 1-based number, null for full screen apps.
+function desktops() {
+  const list = []
+  let n = 0
+  for (const d of ObjC.deepUnwrap($.CGSCopyManagedDisplaySpaces(cid))) {
+    for (const s of d.Spaces) {
+      const user = Number(s.type) === 0
+      list.push({ id: Number(s.id64), uuid: s.uuid || '', display: d['Display Identifier'], desktop: user ? ++n : null })
+    }
+  }
+  return list
+}
+const currentSpace = display => Number($.CGSManagedDisplayGetCurrentSpace(cid, $(display)))
+const spacesOf = num => ObjC.deepUnwrap($.CGSCopySpacesForWindows(cid, 0x7, $.NSArray.arrayWithObject($.NSNumber.numberWithUnsignedInt(num)))).map(Number)
+
+// Mission Control only recognises ctrl+arrow with the flags a real arrow key carries, and
+// without an explicit control up the modifier sticks to every later mouse and key event.
+const CONTROL_FLAG = 0x40000, ARROW_FLAGS = 0x40000 | 0x800000 | 0x200000, FLAGS_CHANGED = 12
+function pressArrow(right) {
+  const press = (code, down, flags, type) => {
+    const ev = $.CGEventCreateKeyboardEvent(null, code, down)
+    if (type) $.CGEventSetType(ev, type)
+    $.CGEventSetFlags(ev, flags)
+    $.CGEventPost(0, ev)
+    delay(0.02)
+  }
+  press(59, true, CONTROL_FLAG, FLAGS_CHANGED)
+  press(right ? 124 : 123, true, ARROW_FLAGS)
+  press(right ? 124 : 123, false, ARROW_FLAGS)
+  press(59, false, 0, FLAGS_CHANGED)
+}
+
+function gotoSpace(target) {
+  const all = desktops()
+  const t = all.find(s => s.id === target)
+  if (!t) return false
+  const row = all.filter(s => s.display === t.display)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const i = row.findIndex(s => s.id === currentSpace(t.display)), j = row.findIndex(s => s.id === target)
+    if (i === -1) return false
+    if (i === j) return true
+    for (let k = 0; k < Math.abs(j - i); k++) { pressArrow(j > i); delay(0.05) }
+    const deadline = Date.now() + 1500 + 900 * Math.abs(j - i)
+    while (Date.now() < deadline && currentSpace(t.display) !== target) delay(0.05)
+    if (currentSpace(t.display) === target) { delay(0.15); return true }
+  }
+  return false
+}
 
 // Window numbers never change while a window is open; pair them with the AX windows by pid + bounds.
 function windowTable() {
@@ -147,53 +203,88 @@ function windowTable() {
     const w = ObjC.deepUnwrap(list.objectAtIndex(i))
     if (w.kCGWindowLayer !== 0) continue
     const b = w.kCGWindowBounds
-    rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID,
+    const spaces = spacesOf(w.kCGWindowNumber)
+    rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID, spaces: spaces, space: spaces.length === 1 ? spaces[0] : null,
       x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) })
   }
   return rows
 }
 
+const all = desktops()
+const byId = new Map(all.map(s => [s.id, s]))
+const label = id => { const s = byId.get(id); return s && s.desktop ? `desktop ${s.desktop}` : `space ${id}` }
+const home = [...new Set(all.map(s => s.display))].map(d => currentSpace(d))
 const table = windowTable()
 const assigned = new Set()
+const seen = new Set()
 
-let procs = []
-try {
-  procs = se.applicationProcesses.whose({ backgroundOnly: false })()
-} catch (e) {
-  if (!blocked(e)) throw e
-  automation = true
-}
+// Visit the current desktop first, then every other desktop that has a window.
+const visits = [...home]
+for (const s of all) if (s.desktop && !visits.includes(s.id) && table.some(r => r.space === s.id)) visits.push(s.id)
+console.log(`${all.filter(s => s.desktop).length} desktops, visiting ${visits.map(label).join(', ')}`)
 
-for (const proc of procs) {
-  let appName, pid
-  try { appName = proc.name(); pid = proc.unixId() } catch (e) { continue }
+for (const space of visits) {
+  if (!home.includes(space)) {
+    if (!switching) break
+    if (!gotoSpace(space)) {
+      console.log(`could not switch to ${label(space)}, skipping the remaining desktops`)
+      switching = false
+      break
+    }
+  }
+  console.log(`-- ${label(space)}`)
 
-  let windows
+  let procs = []
   try {
-    windows = proc.windows()
+    procs = se.applicationProcesses.whose({ backgroundOnly: false })()
   } catch (e) {
-    if (/assistive access/i.test(e.message)) denied = true
-    if (blocked(e)) automation = true
-    continue
+    if (!blocked(e)) throw e
+    automation = true
   }
 
-  windows.forEach(w => {
+  for (const proc of procs) {
+    let appName, pid
+    try { appName = proc.name(); pid = proc.unixId() } catch (e) { continue }
+
+    let windows
     try {
-      const pos = w.position()
-      const size = w.size()
-      if (!pos || !size) return
-      const title = (() => { try { return w.name() } catch (e) { return null } })()
-      const row = table.find(r => r.pid === pid && !assigned.has(r.num) &&
-        r.x === pos[0] && r.y === pos[1] && r.w === size[0] && r.h === size[1])
-      if (row) assigned.add(row.num)
-      const id = row ? row.num : null
-      out.push({ app: appName, id: id, title: title, x: pos[0], y: pos[1], w: size[0], h: size[1] })
-      console.log(`${appName} ${id === null ? '(no window number)' : '#' + id} ${JSON.stringify(title)} ${pos[0]},${pos[1]} ${size[0]}x${size[1]}`)
-    } catch (e) {}
-  })
+      windows = proc.windows()
+    } catch (e) {
+      if (/assistive access/i.test(e.message)) denied = true
+      if (blocked(e)) automation = true
+      continue
+    }
+
+    windows.forEach(w => {
+      try {
+        const pos = w.position()
+        const size = w.size()
+        if (!pos || !size) return
+        const title = (() => { try { return w.name() } catch (e) { return null } })()
+        const fits = r => r.pid === pid && r.x === pos[0] && r.y === pos[1] && r.w === size[0] && r.h === size[1]
+        // Minimized and all-desktop windows are listed on every desktop; record each on its own desktop once.
+        let row = table.find(r => fits(r) && !assigned.has(r.num) && r.space === space)
+        if (!row) {
+          if (table.some(r => fits(r) && (assigned.has(r.num) || r.space !== null))) return
+          row = table.find(r => fits(r) && r.spaces.length > 1)
+        }
+        if (row) assigned.add(row.num)
+        const id = row ? row.num : null
+        const key = `${appName}|${title}|${pos}|${size}`
+        if (id === null) { if (seen.has(key)) return; seen.add(key) }
+        const s = row && row.space !== null ? byId.get(row.space) : null
+        out.push({ app: appName, id: id, title: title, x: pos[0], y: pos[1], w: size[0], h: size[1],
+          desktop: s ? s.desktop : null, space: s ? s.id : null, spaceUUID: s ? s.uuid : null })
+        console.log(`${appName} ${id === null ? '(no window number)' : '#' + id} ${JSON.stringify(title)} ${pos[0]},${pos[1]} ${size[0]}x${size[1]} ` +
+          (s ? `desktop ${s.desktop}` : row ? 'all desktops' : 'no desktop'))
+      } catch (e) {}
+    })
+  }
 }
 
-JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, automation: automation, windows: out }, null, 2)
+for (const space of home) if (!gotoSpace(space)) console.log(`could not return to ${label(space)}`)
+
+JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, automation: automation, switching: switching, windows: out }, null, 2)
 JXA
 
 if /usr/bin/grep -q '"automation": true' "$TMP"; then
@@ -218,8 +309,23 @@ MSG
   exit 1
 fi
 
+if /usr/bin/grep -q '"switching": false' "$TMP"; then
+  cat >&2 <<'MSG'
+Could not switch desktops, so only the current desktop was saved.
+
+Check that System Settings > Keyboard > Keyboard Shortcuts > Mission Control has
+"Move left a space" and "Move right a space" turned on, and that this terminal has
+Accessibility permission.
+MSG
+fi
+
 REPLACED=""
 [[ -f "$LAYOUT" ]] && REPLACED=", replacing the previous one"
 mkdir -p -m 700 "$DIR"
+if [[ "$TAG" == default && -f "$LAYOUT" ]]; then
+  BAK="$TAG.bak-$(date +%Y%m%d)"
+  cp -p "$LAYOUT" "$DIR/$BAK.json"
+  REPLACED=", previous one kept as tag \"$BAK\""
+fi
 cp "$TMP" "$LAYOUT"
-printf 'saved %s windows as tag "%s" in %s%s\n' "$(/usr/bin/grep -c '"app"' "$LAYOUT" || true)" "$TAG" "$LAYOUT" "$REPLACED"
+printf 'saved %s windows on %s desktops as tag "%s" in %s%s\n' "$(count_windows "$LAYOUT")" "$(count_desktops "$LAYOUT")" "$TAG" "$LAYOUT" "$REPLACED"

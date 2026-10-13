@@ -2,14 +2,19 @@
 #
 # restore-windows
 #
-# Puts every window recorded by save-windows under a tag back where it was. Match
-# is by the macOS window number recorded at save time; a window that no longer
-# exists is matched by its exact title or reported as not placed.
+# Puts every window recorded by save-windows under a tag back on its desktop
+# (macOS Space) and in its place. Match is by the macOS window number recorded at
+# save time; a window that no longer exists is matched by its exact title or
+# reported as not placed. Accessibility only lists the windows of the current
+# desktop, so restoring visits each desktop that has saved windows. A window
+# saved on another desktop is carried there the only way macOS still allows:
+# held by its title bar while ctrl+arrow switches desktops.
 #
 #   restore-windows tag    restore that tag
 #   restore-windows        pick a tag from a menu (up/down, Enter, q)
 #
-# Needs Accessibility permission for whichever terminal runs it.
+# Needs Accessibility permission for whichever terminal runs it, and Mission
+# Control's "Move left/right a space" shortcuts (on by default).
 #
 # Author:    drxyu (https://github.com/drxyu)
 # Copyright: (c) 2026 drxyu
@@ -43,8 +48,9 @@ load_tags() {
 }
 
 describe() {
-  printf '%-*s  saved %s  %s windows' "$WIDTH" "$1" \
-    "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$1.json")" "$(/usr/bin/grep -c '"app"' "$DIR/$1.json" || true)"
+  printf '%-*s  saved %s  %s windows on %s desktops' "$WIDTH" "$1" \
+    "$(stat -f '%Sm' -t '%b %d %H:%M' "$DIR/$1.json")" "$(/usr/bin/grep -c '"app"' "$DIR/$1.json" || true)" \
+    "$(/usr/bin/grep -oE '"desktop": [0-9]+' "$DIR/$1.json" | sort -u | /usr/bin/grep -c . || true)"
 }
 
 list_tags() {
@@ -147,6 +153,13 @@ printf 'restoring tag "%s" (saved %s)\n' "$TAG" "$(stat -f '%Sm' -t '%b %d %H:%M
 RESULT="$(osascript -l JavaScript - "$LAYOUT" <<'JXA'
 ObjC.import('Foundation')
 ObjC.import('CoreGraphics')
+ObjC.import('ApplicationServices')
+ObjC.import('AppKit')
+ObjC.bindFunction('CGSMainConnectionID', ['int', []])
+ObjC.bindFunction('CGSCopyManagedDisplaySpaces', ['id', ['int']])
+ObjC.bindFunction('CGSCopySpacesForWindows', ['id', ['int', 'int', 'id']])
+ObjC.bindFunction('CGSManagedDisplayGetCurrentSpace', ['unsigned long long', ['int', 'id']])
+ObjC.bindFunction('CGDisplayCreateUUIDFromDisplayID', ['id', ['unsigned int']])
 
 function run(argv) {
   const raw = ObjC.unwrap(
@@ -155,107 +168,329 @@ function run(argv) {
   const saved = JSON.parse(raw).windows || []
   if (saved.length === 0) return 'EMPTY'
 
+  const cid = $.CGSMainConnectionID()
   const se = Application('System Events')
-  const byApp = {}
-  for (const entry of saved) (byApp[entry.app] ||= []).push(entry)
-
-  let moved = 0, missed = 0, denied = false, automation = false
+  let placed = 0, relocated = 0, missed = 0, denied = false, automation = false, switching = true
   const blocked = e => e.errorNumber === -1743 || /not authori[sz]ed to send apple events/i.test(String(e.message))
 
-  // Current bounds of a window number, or null once that window is closed.
-  function cgBounds(num) {
-    const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0x10, 0))
-    for (let i = 0; i < list.count; i++) {
-      const w = ObjC.deepUnwrap(list.objectAtIndex(i))
-      if (w.kCGWindowNumber !== num) continue
-      const b = w.kCGWindowBounds
-      return { x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) }
+  // Every Space in Mission Control order; desktop is its 1-based number, null for full screen apps.
+  function desktops() {
+    const list = []
+    let n = 0
+    for (const d of ObjC.deepUnwrap($.CGSCopyManagedDisplaySpaces(cid))) {
+      for (const s of d.Spaces) {
+        const user = Number(s.type) === 0
+        list.push({ id: Number(s.id64), uuid: s.uuid || '', display: d['Display Identifier'], desktop: user ? ++n : null })
+      }
     }
-    return null
+    return list
+  }
+  const currentSpace = display => Number($.CGSManagedDisplayGetCurrentSpace(cid, $(display)))
+  const spacesOf = num => ObjC.deepUnwrap($.CGSCopySpacesForWindows(cid, 0x7, $.NSArray.arrayWithObject($.NSNumber.numberWithUnsignedInt(num)))).map(Number)
+
+  // Mission Control only recognises ctrl+arrow with the flags a real arrow key carries, and
+  // without an explicit control up the modifier sticks to every later mouse and key event.
+  const CONTROL_FLAG = 0x40000, ARROW_FLAGS = 0x40000 | 0x800000 | 0x200000, FLAGS_CHANGED = 12
+  function pressArrow(right) {
+    const press = (code, down, flags, type) => {
+      const ev = $.CGEventCreateKeyboardEvent(null, code, down)
+      if (type) $.CGEventSetType(ev, type)
+      $.CGEventSetFlags(ev, flags)
+      $.CGEventPost(0, ev)
+      delay(0.02)
+    }
+    press(59, true, CONTROL_FLAG, FLAGS_CHANGED)
+    press(right ? 124 : 123, true, ARROW_FLAGS)
+    press(right ? 124 : 123, false, ARROW_FLAGS)
+    press(59, false, 0, FLAGS_CHANGED)
   }
 
+  // With "Displays have separate Spaces" the shortcut acts on the display under the pointer.
+  function pointAtDisplay(display) {
+    if (display === 'Main') return
+    try {
+      const screens = $.NSScreen.screens
+      const top = screens.objectAtIndex(0).frame.size.height
+      for (let i = 0; i < screens.count; i++) {
+        const sc = screens.objectAtIndex(i)
+        const did = ObjC.unwrap(sc.deviceDescription.objectForKey('NSScreenNumber'))
+        const uuid = ObjC.unwrap(ObjC.castRefToObject($.CFUUIDCreateString(null, $.CGDisplayCreateUUIDFromDisplayID(did))))
+        if (uuid !== display) continue
+        const f = sc.frame
+        $.CGWarpMouseCursorPosition({ x: f.origin.x + f.size.width / 2, y: top - f.origin.y - f.size.height / 2 })
+        return
+      }
+    } catch (e) {}
+  }
+
+  function gotoSpace(target, holding) {
+    const all = desktops()
+    const t = all.find(s => s.id === target)
+    if (!t) return false
+    const row = all.filter(s => s.display === t.display)
+    if (!holding) pointAtDisplay(t.display)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const i = row.findIndex(s => s.id === currentSpace(t.display)), j = row.findIndex(s => s.id === target)
+      if (i === -1) return false
+      if (i === j) return true
+      for (let k = 0; k < Math.abs(j - i); k++) { pressArrow(j > i); delay(0.05) }
+      const deadline = Date.now() + 1500 + 900 * Math.abs(j - i)
+      while (Date.now() < deadline && currentSpace(t.display) !== target) delay(0.05)
+      if (currentSpace(t.display) === target) { delay(0.15); return true }
+    }
+    return false
+  }
+
+  function cgList() {
+    const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0x10, 0))
+    const rows = []
+    for (let i = 0; i < list.count; i++) {
+      const w = ObjC.deepUnwrap(list.objectAtIndex(i))
+      if (w.kCGWindowLayer !== 0) continue
+      const b = w.kCGWindowBounds
+      rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID, x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) })
+    }
+    return rows
+  }
+  // Current bounds of a window number, or null once that window is closed.
+  const cgBounds = num => cgList().find(r => r.num === num) || null
   const same = (a, b) => a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
+  const cgFind = (pid, g) => { const r = cgList().find(r => r.pid === pid && same(r, g)); return r ? r.num : null }
   const geom = w => { const p = w.position(), s = w.size(); return { x: p[0], y: p[1], w: s[0], h: s[1] } }
   const place = (w, g) => { w.position = [g.x, g.y]; w.size = [g.w, g.h] }
   const label = e => `${e.app} ${e.id == null ? '' : '#' + e.id + ' '}${JSON.stringify(e.title)}`
   const where = g => `${g.x},${g.y} ${g.w}x${g.h}`
 
-  for (const appName of Object.keys(byApp)) {
-    let windows
+  const live = desktops()
+  const byId = new Map(live.map(s => [s.id, s]))
+  const deskLabel = id => { const s = byId.get(id); return s && s.desktop ? `desktop ${s.desktop}` : `space ${id}` }
+  const home = [...new Set(live.map(s => s.display))].map(d => currentSpace(d))
+  const mouse0 = $.CGEventGetLocation($.CGEventCreate(null))
+  let front = null
+  try { front = se.applicationProcesses.whose({ frontmost: true })()[0].name() } catch (e) {}
+  const unhidden = []
+
+  for (const e of saved) {
+    let t = null
+    if (e.spaceUUID) t = live.find(s => s.desktop && s.uuid === e.spaceUUID)
+    if (!t && e.space != null) t = live.find(s => s.desktop && s.id === e.space)
+    if (!t && e.desktop != null) t = live.find(s => s.desktop === e.desktop)
+    e.target = t ? t.id : null
+    if (e.desktop != null && !t) console.log(`note ${label(e)} desktop ${e.desktop} no longer exists, placing only`)
+  }
+
+  // Visit the current desktop first, then every desktop that holds a saved window.
+  const wanted = new Set(home)
+  for (const e of saved) if (e.id != null) { const sp = spacesOf(e.id); if (sp.length === 1) wanted.add(sp[0]) }
+  const visits = home.concat(live.filter(s => s.desktop && wanted.has(s.id) && !home.includes(s.id)).map(s => s.id))
+
+  const sys = $.AXUIElementCreateSystemWide()
+  const cfs = s => $.CFStringCreateWithCString(null, s, 0x08000100)
+  function elementAt(x, y) {
+    const ref = Ref()
+    if ($.AXUIElementCopyElementAtPosition(sys, x, y, ref) !== 0) return null
+    const pidRef = Ref(), roleRef = Ref()
+    $.AXUIElementGetPid(ref[0], pidRef)
+    const role = $.AXUIElementCopyAttributeValue(ref[0], cfs('AXRole'), roleRef) === 0 ? ObjC.unwrap(ObjC.castRefToObject(roleRef[0])) : ''
+    return { pid: pidRef[0], role: String(role) }
+  }
+  const CONTROL = /Button|TextField|TextArea|CheckBox|Slider|ComboBox|Link|Image|ScrollBar|Incrementor|MenuBar|PopUp|Disclosure/
+  // A spot on the title bar row that belongs to this window and is not a control.
+  function grabPoint(pid, w, g) {
+    let y = g.y + 14
     try {
-      windows = se.applicationProcesses.byName(appName).windows()
-    } catch (e) {
-      if (/assistive access/i.test(e.message)) denied = true
-      if (blocked(e)) automation = true
-      missed += byApp[appName].length
-      continue
+      for (const b of w.buttons()) {
+        if (!/AXFullScreenButton|AXZoomButton|AXCloseButton|AXMinimizeButton/.test(b.subrole())) continue
+        y = b.position()[1] + b.size()[1] / 2
+        break
+      }
+    } catch (e) {}
+    const xs = [g.w - 24, 100, g.w / 2, g.w * 3 / 4, g.w / 4, 160, g.w - 60].map(dx => g.x + Math.round(dx))
+    for (const x of xs) {
+      if (x <= g.x + 4 || x >= g.x + g.w - 4) continue
+      const el = elementAt(x, y)
+      if (el && el.pid === pid && !CONTROL.test(el.role)) return { x: x, y: y, role: el.role }
     }
+    return null
+  }
+  const isMinimized = w => { try { return w.attributes.byName('AXMinimized').value() === true } catch (e) { return false } }
 
-    const taken = new Set()
-
-    for (const entry of byApp[appName]) {
-      const current = entry.id == null ? null : cgBounds(entry.id)
-
-      if (current) {
-        if (same(current, entry)) {
-          moved++
-          console.log(`placed ${label(entry)} already at ${where(entry)}`)
-          continue
-        }
-        // Several windows can share one spot after an unplug, so a move only counts once the
-        // window number itself is seen to leave it.
-        let verified = -1, candidates = 0
-        for (let i = 0; i < windows.length && verified === -1; i++) {
-          if (taken.has(i)) continue
-          let g
-          try { g = geom(windows[i]) } catch (e) { continue }
-          if (!same(g, current)) continue
-          candidates++
-          let ok = false
-          try {
-            place(windows[i], entry)
-            let after = cgBounds(entry.id)
-            if (after !== null && same(after, current)) { delay(0.05); after = cgBounds(entry.id) }
-            ok = after !== null && !same(after, current)
-          } catch (e) {}
-          if (ok) { verified = i; break }
-          try { place(windows[i], current) } catch (e) {}
-        }
-        if (verified === -1) {
-          missed++
-          console.log(`missed ${label(entry)} none of ${candidates} candidates at ${where(current)} verified`)
-          continue
-        }
-        taken.add(verified)
-        moved++
-        console.log(`placed ${label(entry)} -> ${where(entry)} [by id]`)
-        continue
-      }
-
-      // The window is gone or never had a number: exact title only, never its slot in the list.
-      const target = windows.findIndex((w, i) => {
-        if (taken.has(i)) return false
-        try { return entry.title !== null && w.name() === entry.title } catch (e) { return false }
-      })
-      if (target === -1) {
-        missed++
-        console.log(`missed ${label(entry)} ${entry.id == null ? 'no window number' : 'window closed'}, no exact title match`)
-        continue
-      }
+  // The AX window whose bounds are those of window number num; identical twins are told apart by nudging.
+  function axWindow(proc, num) {
+    const cur = cgBounds(num)
+    if (!cur) return null
+    let candidates
+    try { candidates = proc.windows().filter(w => { try { return same(geom(w), cur) } catch (e) { return false } }) } catch (e) { return null }
+    if (candidates.length === 1) return candidates[0]
+    for (const w of candidates) {
       try {
-        place(windows[target], entry)
-        taken.add(target)
-        moved++
-        console.log(`placed ${label(entry)} -> ${where(entry)} [by title]`)
+        w.position = [cur.x + 1, cur.y]
+        let after = cgBounds(num)
+        if (after && same(after, cur)) { delay(0.05); after = cgBounds(num) }
+        w.position = [cur.x, cur.y]
+        if (after && after.x === cur.x + 1) return w
+      } catch (e) {}
+    }
+    return null
+  }
+
+  // Hold the window by its title bar while ctrl+arrow switches desktops; macOS 14.5+ allows nothing else.
+  function dragToDesktop(proc, entry, from) {
+    const w = axWindow(proc, entry.id)
+    if (!w) return `not found on ${deskLabel(from)}`
+    if (isMinimized(w)) return 'minimized'
+    try { if (!proc.visible()) unhidden.push(entry.app) } catch (e) {}
+    try { proc.frontmost = true } catch (e) {}
+    try { w.actions.byName('AXRaise').perform() } catch (e) {}
+    delay(0.25)
+    const g = cgBounds(entry.id)
+    if (!g) return 'window closed'
+    const pt = grabPoint(proc.unixId(), w, g)
+    if (!pt) return 'no free spot on its title bar'
+    console.log(`  holding ${label(entry)} at ${pt.x},${pt.y} (${pt.role})`)
+    const mouse = (type, x, y) => { const ev = $.CGEventCreateMouseEvent(null, type, { x: x, y: y }, 0); $.CGEventSetFlags(ev, 0); $.CGEventPost(0, ev) }
+    mouse(1, pt.x, pt.y); delay(0.08)
+    mouse(6, pt.x + 1, pt.y); delay(0.08)
+    const ok = gotoSpace(entry.target, true)
+    delay(0.25)
+    mouse(2, pt.x + 1, pt.y); delay(0.2)
+    if (!ok) { switching = false; return 'could not switch desktops' }
+    const deadline = Date.now() + 1500
+    let sp = spacesOf(entry.id)
+    while (Date.now() < deadline && !(sp.length === 1 && sp[0] === entry.target)) { delay(0.05); sp = spacesOf(entry.id) }
+    if (!(sp.length === 1 && sp[0] === entry.target)) return `stayed on ${sp.length === 1 ? deskLabel(sp[0]) : 'its desktop'}`
+    const w2 = axWindow(proc, entry.id)
+    if (w2) try { place(w2, entry) } catch (e) {}
+    return null
+  }
+
+  const pending = new Set(saved)
+  const notRunning = new Set()
+
+  // Marks an entry placed; a window saved on another desktop waits for the visit to its own.
+  function settle(entry, how, space, drags) {
+    let from = null
+    if (entry.id != null) { const sp = spacesOf(entry.id); if (sp.length === 1) from = sp[0] }
+    const movable = from != null && byId.get(from) && byId.get(from).desktop
+    if (entry.target == null || !movable || from === entry.target) {
+      pending.delete(entry); placed++
+      console.log(`placed ${label(entry)} ${how} ${where(entry)}${entry.target != null && from === entry.target ? ' on ' + deskLabel(from) : ''}`)
+      return
+    }
+    if (from !== space) return
+    pending.delete(entry); placed++
+    console.log(`placed ${label(entry)} ${how} ${where(entry)}, moving to ${deskLabel(entry.target)}`)
+    drags.push(entry)
+  }
+
+  for (const space of visits) {
+    if (pending.size === 0 || !switching) break
+    const display = byId.get(space).display
+    if (currentSpace(display) !== space && !gotoSpace(space, false)) {
+      console.log(`could not switch to ${deskLabel(space)}`)
+      switching = false
+      break
+    }
+    console.log(`-- ${deskLabel(space)}`)
+
+    for (const appName of new Set([...pending].map(e => e.app))) {
+      if (notRunning.has(appName)) continue
+      const entries = [...pending].filter(e => e.app === appName)
+      let proc, windows, pid
+      try {
+        proc = se.applicationProcesses.byName(appName)
+        windows = proc.windows()
+        pid = proc.unixId()
       } catch (e) {
-        missed++
-        console.log(`missed ${label(entry)} move failed: ${e.message}`)
+        if (/assistive access/i.test(e.message)) denied = true
+        if (blocked(e)) automation = true
+        notRunning.add(appName)
+        continue
+      }
+
+      const taken = new Set()
+      const drags = []
+
+      for (const entry of entries) {
+        const current = entry.id == null ? null : cgBounds(entry.id)
+
+        if (current) {
+          if (same(current, entry)) { settle(entry, 'already at', space, drags); continue }
+          // Several windows can share one spot after an unplug, so a move only counts once the
+          // window number itself is seen to leave it.
+          let verified = -1
+          for (let i = 0; i < windows.length && verified === -1; i++) {
+            if (taken.has(i)) continue
+            let g
+            try { g = geom(windows[i]) } catch (e) { continue }
+            if (!same(g, current)) continue
+            let ok = false
+            try {
+              place(windows[i], entry)
+              let after = cgBounds(entry.id)
+              if (after !== null && same(after, current)) { delay(0.05); after = cgBounds(entry.id) }
+              ok = after !== null && !same(after, current)
+            } catch (e) {}
+            if (ok) { verified = i; break }
+            try { place(windows[i], current) } catch (e) {}
+          }
+          if (verified === -1) continue
+          taken.add(verified)
+          settle(entry, '->', space, drags)
+          continue
+        }
+
+        // The window is gone or never had a number: exact title only, never its slot in the list.
+        const target = windows.findIndex((w, i) => {
+          if (taken.has(i)) return false
+          try { return entry.title !== null && w.name() === entry.title } catch (e) { return false }
+        })
+        if (target === -1) continue
+        try {
+          place(windows[target], entry)
+          taken.add(target)
+          entry.id = cgFind(pid, entry)
+          settle(entry, '-> [by title]', space, drags)
+        } catch (e) {
+          pending.delete(entry)
+          missed++
+          console.log(`missed ${label(entry)} move failed: ${e.message}`)
+        }
+      }
+
+      for (const entry of drags) {
+        if (!switching) break
+        if (currentSpace(display) !== space && !gotoSpace(space, false)) { switching = false; break }
+        const err = dragToDesktop(proc, entry, space)
+        if (err) console.log(`left ${label(entry)} on ${deskLabel(space)}: ${err}`)
+        else { relocated++; console.log(`moved ${label(entry)} to ${deskLabel(entry.target)}`) }
       }
     }
   }
 
+  for (const entry of pending) {
+    missed++
+    let why = 'window closed, no exact title match'
+    if (notRunning.has(entry.app)) why = 'app not running'
+    else if (entry.id == null) why = 'no window number, no exact title match'
+    else if (cgBounds(entry.id)) { const sp = spacesOf(entry.id); why = `could not be matched on ${sp.length === 1 ? deskLabel(sp[0]) : 'its desktop'}` }
+    console.log(`missed ${label(entry)} ${why}`)
+  }
+
+  for (const space of home) if (switching && !gotoSpace(space, false)) console.log(`could not return to ${deskLabel(space)}`)
+  $.CGWarpMouseCursorPosition(mouse0)
+  for (const name of unhidden) try { se.applicationProcesses.byName(name).visible = false } catch (e) {}
+  if (front && relocated > 0) {
+    try {
+      const p = se.applicationProcesses.byName(front), pid = p.unixId()
+      if (cgList().some(r => r.pid === pid && spacesOf(r.num).includes(home[0]))) p.frontmost = true
+    } catch (e) {}
+  }
+
   if (automation) return 'AUTOMATION'
-  return denied ? 'DENIED' : `restored ${moved} windows, ${missed} could not be placed`
+  if (denied) return 'DENIED'
+  return `restored ${placed} windows (${relocated} moved to another desktop), ${missed} could not be placed` +
+    (switching ? '' : '; desktop switching failed, see above')
 }
 JXA
 )"
@@ -283,5 +518,12 @@ Then quit that app fully and reopen it before trying again.
 MSG
     exit 1 ;;
   *)
-    printf '%s\n' "$RESULT" ;;
+    printf '%s\n' "$RESULT"
+    case "$RESULT" in *'desktop switching failed'*)
+      cat >&2 <<'MSG'
+
+Check that System Settings > Keyboard > Keyboard Shortcuts > Mission Control has
+"Move left a space" and "Move right a space" turned on.
+MSG
+    esac ;;
 esac
