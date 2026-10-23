@@ -45,7 +45,7 @@ macOS only lets a program see the windows on the current desktop, so both comman
 
 ```sh
 save-windows home        # save every window's spot as "home"
-save-windows             # same, under the tag "default" (the old default is kept as default.bak-<date>)
+save-windows             # same, under the tag "default" (the old default is kept as default.bak-<its save time>)
 save-windows -l          # list your saved layouts
 save-windows -l home     # show what "home" remembers
 save-windows -d home     # delete "home"
@@ -53,7 +53,11 @@ restore-windows home     # put everything back
 restore-windows          # pick a layout from a menu
 ```
 
-A window redock can't identify for sure gets skipped, never shuffled around. Minimized windows and full screen apps stay where they are.
+A window that's gone, say after a reboot, is replaced by another window of the same app, and the layout remembers the swap.
+
+VS Code forgets the name of every terminal you moved into its own window, each time it restarts. redock doesn't. Restore types each name back in, but only into a terminal sitting at its shell prompt, never into a running program; restore again once that program quits. A name that starts with a command, say `npm run dev`, is never typed, since a keystroke that misses VS Code's rename box would run it. Run save before restore and it keeps each lost name anyway, as long as the terminal shows nothing but `zsh`, a Claude Code status or a running program. Hands off the keyboard while it types.
+
+A minimized window comes back up in its place. One that was minimized when you saved goes back to the Dock. Full screen apps stay where they are.
 
 ## Fine print
 

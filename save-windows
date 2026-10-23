@@ -2,14 +2,18 @@
 #
 # save-windows
 #
-# Records the position, size, desktop (macOS Space) and window number of every
-# open window under a tag (home, office, ...) in ~/.window-layouts/<tag>.json, so
-# restore-windows can put them back after the external displays are replugged.
-# Accessibility only lists the windows of the current desktop, so saving visits
-# every desktop that has windows and comes back to where it started.
+# Records the position, size, desktop (macOS Space), window number and minimized
+# state of every open window under a tag (home, office, ...) in
+# ~/.window-layouts/<tag>.json, so restore-windows can put them back after the
+# external displays are replugged. Accessibility only lists the windows of the
+# current desktop, so saving visits every desktop that has windows and comes back
+# to where it started. VS Code forgets terminal names when it restarts, so after
+# a restart a VS Code window showing only its shell, a status or a program keeps
+# the name it had in the layout being replaced (or, for a new tag, the last one
+# saved), flagged for restore-windows to type back in.
 #
 #   save-windows tag       save under tag
-#   save-windows           save under the tag "default"; the previous default is kept as default.bak-<date>
+#   save-windows           save under the tag "default"; the previous default is kept as default.bak-<its save time>
 #   save-windows -l        list saved tags
 #   save-windows -l tag    show the windows saved under tag
 #   save-windows -d tag    delete a saved tag
@@ -30,7 +34,7 @@ TAG_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 usage() {
   cat <<'USAGE'
 usage: save-windows tag       save every window's desktop and place under tag
-       save-windows           same, under the tag "default"; the old default is kept as default.bak-<date>
+       save-windows           same, under the tag "default"; the old default is kept as default.bak-<its save time>
        save-windows -l        list saved tags
        save-windows -l tag    show the windows saved under tag
        save-windows -d tag    delete a saved tag
@@ -93,7 +97,7 @@ function run(argv) {
   const desk = r => r.desktop == null ? 99 : r.desktop
   rows.sort((a, b) => desk(a) - desk(b) || a.x - b.x || a.y - b.y).forEach(r => lines.push(
     `  ${(r.desktop == null ? '-' : 'd' + r.desktop).padEnd(4)}${String(r.app || "").slice(0, 22).padEnd(22)} (${String(r.x).padStart(6)},${String(r.y).padStart(5)})  ` +
-    `${(r.w + 'x' + r.h).padEnd(11)} ${(r.title || '').slice(0, 44)}`))
+    `${(r.w + 'x' + r.h).padEnd(11)} ${r.minimized ? '[minimized] ' : ''}${(r.title || '').slice(0, 44)}`))
   return lines.join('\n')
 }
 JXA
@@ -132,8 +136,14 @@ LAYOUT="$DIR/$TAG.json"
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
+PREV="$LAYOUT"
+[[ -f "$PREV" ]] || PREV="$(ls -t "$DIR"/*.json 2>/dev/null | head -n 1 || true)"
+BOOTED="$(sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')"
+PROGRAMS="$(ps -axo comm= | sed 's#.*/##' | sort -u)"
 
-osascript -l JavaScript <<'JXA' > "$TMP"
+PREV_LAYOUT="$PREV" BOOTED="$BOOTED" PROGRAMS="$PROGRAMS" osascript -l JavaScript <<'JXA' > "$TMP"
+ObjC.import('Foundation')
+ObjC.import('AppKit')
 ObjC.import('CoreGraphics')
 ObjC.bindFunction('CGSMainConnectionID', ['int', []])
 ObjC.bindFunction('CGSCopyManagedDisplaySpaces', ['id', ['int']])
@@ -209,6 +219,13 @@ function windowTable() {
   }
   return rows
 }
+function onScreen() {
+  const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1, 0))
+  const nums = new Set()
+  for (let i = 0; i < list.count; i++) nums.add(ObjC.deepUnwrap(list.objectAtIndex(i)).kCGWindowNumber)
+  return nums
+}
+const isMinimized = w => { try { return w.attributes.byName('AXMinimized').value() === true } catch (e) { return false } }
 
 const all = desktops()
 const byId = new Map(all.map(s => [s.id, s]))
@@ -217,6 +234,7 @@ const home = [...new Set(all.map(s => s.display))].map(d => currentSpace(d))
 const table = windowTable()
 const assigned = new Set()
 const seen = new Set()
+const pids = new Map()
 
 // Visit the current desktop first, then every other desktop that has a window.
 const visits = [...home]
@@ -233,6 +251,7 @@ for (const space of visits) {
     }
   }
   console.log(`-- ${label(space)}`)
+  const shown = onScreen()
 
   let procs = []
   try {
@@ -245,44 +264,131 @@ for (const space of visits) {
   for (const proc of procs) {
     let appName, pid
     try { appName = proc.name(); pid = proc.unixId() } catch (e) { continue }
+    pids.set(appName, pid)
 
     let windows
     try {
-      windows = proc.windows()
+      // System Events refers to a window by its title, so same-title windows would all read as the first: go by list position.
+      windows = Array.from({ length: proc.windows.length }, (_, i) => proc.windows[i])
     } catch (e) {
       if (/assistive access/i.test(e.message)) denied = true
       if (blocked(e)) automation = true
       continue
     }
 
-    windows.forEach(w => {
+    const infos = []
+    for (const w of windows) {
       try {
         const pos = w.position()
         const size = w.size()
-        if (!pos || !size) return
-        const title = (() => { try { return w.name() } catch (e) { return null } })()
-        const fits = r => r.pid === pid && r.x === pos[0] && r.y === pos[1] && r.w === size[0] && r.h === size[1]
-        // Minimized and all-desktop windows are listed on every desktop; record each on its own desktop once.
-        let row = table.find(r => fits(r) && !assigned.has(r.num) && r.space === space)
-        if (!row) {
-          if (table.some(r => fits(r) && (assigned.has(r.num) || r.space !== null))) return
-          row = table.find(r => fits(r) && r.spaces.length > 1)
+        if (!pos || !size) continue
+        infos.push({ pos: pos, size: size, title: (() => { try { return w.name() } catch (e) { return null } })(), minimized: isMinimized(w) })
+      } catch (e) {}
+    }
+    // Minimized windows at one spot look alike, so they get no window number rather than each other's.
+    const spots = infos.filter(i => i.minimized).map(i => `${i.pos}|${i.size}`)
+    const twins = new Set(spots.filter((k, n) => spots.indexOf(k) !== n))
+    const count = new Map()
+
+    infos.forEach(({ pos, size, title, minimized }) => {
+      try {
+        // A minimized window is never on screen, so it cannot be a same-spot twin that is.
+        const fits = r => r.pid === pid && r.x === pos[0] && r.y === pos[1] && r.w === size[0] && r.h === size[1] && !(minimized && shown.has(r.num))
+        let row = null
+        if (!(minimized && twins.has(`${pos}|${size}`))) {
+          // Minimized and all-desktop windows are listed on every desktop; record each on its own desktop once.
+          const here = r => fits(r) && !assigned.has(r.num) && r.space === space
+          row = table.find(r => here(r) && minimized !== shown.has(r.num)) || table.find(here)
+          if (!row) {
+            if (table.some(r => fits(r) && (assigned.has(r.num) || r.space !== null))) return
+            row = table.find(r => fits(r) && r.spaces.length > 1)
+          }
         }
         if (row) assigned.add(row.num)
         const id = row ? row.num : null
-        const key = `${appName}|${title}|${pos}|${size}`
+        // Counted per desktop, so same-title twins stay apart while a later desktop listing them again is skipped.
+        const base = `${appName}|${title}|${pos}|${size}`
+        count.set(base, (count.get(base) || 0) + 1)
+        const key = `${base}|${count.get(base)}`
         if (id === null) { if (seen.has(key)) return; seen.add(key) }
         const s = row && row.space !== null ? byId.get(row.space) : null
         out.push({ app: appName, id: id, title: title, x: pos[0], y: pos[1], w: size[0], h: size[1],
-          desktop: s ? s.desktop : null, space: s ? s.id : null, spaceUUID: s ? s.uuid : null })
+          desktop: s ? s.desktop : null, space: s ? s.id : null, spaceUUID: s ? s.uuid : null, minimized: minimized })
         console.log(`${appName} ${id === null ? '(no window number)' : '#' + id} ${JSON.stringify(title)} ${pos[0]},${pos[1]} ${size[0]}x${size[1]} ` +
-          (s ? `desktop ${s.desktop}` : row ? 'all desktops' : 'no desktop'))
+          (s ? `desktop ${s.desktop}` : row ? 'all desktops' : 'no desktop') + (minimized ? ', minimized' : ''))
       } catch (e) {}
     })
   }
 }
 
 for (const space of home) if (!gotoSpace(space)) console.log(`could not return to ${label(space)}`)
+
+const VSCODE = 'Code'
+// What VS Code shows for a terminal nobody named: its shell, the status Claude Code sets, or a program version.
+const unnamed = t => /^-?(zsh|bash|sh|fish|ksh|tcsh|csh|pwsh|nu)$/.test(t) || /^[✳◐◑] /u.test(t) || /^\d+(\.\d+)+$/.test(t)
+const named = t => typeof t === 'string' && t.trim() !== '' && !unnamed(t)
+// A window of a folder workspace shows "name — folder", which is no terminal name to type back.
+const typable = t => named(t) && !t.includes(' — ')
+const same = (a, b) => a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
+
+// The only window at the saved spot of an entry first, then the rest in the order VS Code reopens them, trusted only when the counts match.
+function pairUp(entries, wins) {
+  const pairs = []
+  let es = [...entries], ws = [...wins]
+  for (const e of [...es]) {
+    const hits = ws.filter(w => same(e, w))
+    if (hits.length !== 1 || es.filter(o => same(o, hits[0])).length !== 1) continue
+    pairs.push([e, hits[0], true])
+    es = es.filter(o => o !== e)
+    ws = ws.filter(o => o !== hits[0])
+  }
+  const sure = es.length === ws.length
+  es.forEach((e, i) => { if (i < ws.length) pairs.push([e, ws[i], sure]) })
+  return pairs
+}
+
+// VS Code drops terminal names on restart, so a terminal showing only its shell, a status or a program keeps the name the last layout
+// gave it; "kept" tells restore-windows to type that name back in even when VS Code has not restarted since.
+function keepNames() {
+  const env = $.NSProcessInfo.processInfo.environment
+  const path = ObjC.unwrap(env.objectForKey('PREV_LAYOUT'))
+  if (!path || !pids.has(VSCODE)) return
+  let prev
+  try { prev = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null))) } catch (e) { return }
+  const before = (prev.windows || []).filter(e => e.app === VSCODE)
+  const now = out.filter(e => e.app === VSCODE)
+  if (before.length === 0 || now.length === 0) return
+  // VS Code shows the program running in a terminal that lost its name, such as node for a dev server.
+  const programs = new Set(String(ObjC.unwrap(env.objectForKey('PROGRAMS')) || '').split('\n').filter(Boolean))
+  const lost = t => unnamed(t) || programs.has(t)
+  const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pids.get(VSCODE))
+  const started = app.isNil() || app.launchDate.isNil() ? Number(ObjC.unwrap(env.objectForKey('BOOTED'))) * 1000 : app.launchDate.timeIntervalSince1970 * 1000
+  const restarted = started > Date.parse(prev.savedAt)
+  let pairs = []
+  if (!restarted) {
+    for (const o of now) { const e = o.id == null ? null : before.find(e => e.id === o.id); if (e) pairs.push([e, o, true]) }
+  } else {
+    console.log(`${VSCODE} started after ${path} was saved, pairing its windows by title, spot and order`)
+    const order = (a, b) => (a.id == null ? Infinity : a.id) - (b.id == null ? Infinity : b.id) || 0
+    let es = [...before].sort(order), ws = [...now].sort(order)
+    for (const o of [...ws]) {
+      const e = es.find(e => named(e.title) && e.title === o.title)
+      if (!e) continue
+      pairs.push([e, o, true])
+      es = es.filter(x => x !== e)
+      ws = ws.filter(x => x !== o)
+    }
+    pairs = pairs.concat(pairUp(es, ws))
+  }
+  for (const [e, o, sure] of pairs) {
+    // Without a restart a renamed terminal keeps its name, so a shell title there is another tab unless the name was already waiting.
+    if (!sure || !typable(e.title) || !lost(o.title) || !(restarted || e.kept)) continue
+    console.log(`${VSCODE} #${o.id} ${JSON.stringify(o.title)} keeps the name ${JSON.stringify(e.title)} from ${path}`)
+    o.title = e.title
+    o.kept = true
+  }
+}
+keepNames()
 
 JSON.stringify({ savedAt: new Date().toISOString(), denied: denied, automation: automation, switching: switching, windows: out }, null, 2)
 JXA
@@ -323,8 +429,8 @@ REPLACED=""
 [[ -f "$LAYOUT" ]] && REPLACED=", replacing the previous one"
 mkdir -p -m 700 "$DIR"
 if [[ "$TAG" == default && -f "$LAYOUT" ]]; then
-  BAK="$TAG.bak-$(date +%Y%m%d)"
-  cp -p "$LAYOUT" "$DIR/$BAK.json"
+  BAK="$TAG.bak-$(stat -f '%Sm' -t '%Y%m%d-%H%M%S' "$LAYOUT")"
+  [[ -e "$DIR/$BAK.json" ]] || cp -p "$LAYOUT" "$DIR/$BAK.json"
   REPLACED=", previous one kept as tag \"$BAK\""
 fi
 cp "$TMP" "$LAYOUT"

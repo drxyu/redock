@@ -4,11 +4,16 @@
 #
 # Puts every window recorded by save-windows under a tag back on its desktop
 # (macOS Space) and in its place. Match is by the macOS window number recorded at
-# save time; a window that no longer exists is matched by its exact title or
-# reported as not placed. Accessibility only lists the windows of the current
-# desktop, so restoring visits each desktop that has saved windows. A window
-# saved on another desktop is carried there the only way macOS still allows:
-# held by its title bar while ctrl+arrow switches desktops.
+# save time, ignored for an app that restarted since (numbers restart after a
+# reboot); a window that no longer exists is matched by its exact title, else a
+# spare window of the same app takes its place. VS Code forgets terminal names
+# when it restarts, so a VS Code terminal window sitting at its shell prompt is
+# renamed to the saved title. The layout is then updated with the windows used.
+# A minimized window is brought back up, unless it was minimized when saved;
+# then it goes back to the Dock. Accessibility only lists the windows of the
+# current desktop, so restoring visits each desktop that has saved windows. A
+# window saved on another desktop is carried there the only way macOS still
+# allows: held by its title bar while ctrl+arrow switches desktops.
 #
 #   restore-windows tag    restore that tag
 #   restore-windows        pick a tag from a menu (up/down, Enter, q)
@@ -149,8 +154,30 @@ fi
 
 LAYOUT="$DIR/$TAG.json"
 printf 'restoring tag "%s" (saved %s)\n' "$TAG" "$(stat -f '%Sm' -t '%b %d %H:%M' "$LAYOUT")" >&2
+UPDATED="$(mktemp)"
+trap 'rm -f "$UPDATED"' EXIT
+BOOTED="$(sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')"
+LOGIN_SHELL="${SHELL:-/bin/zsh}"
+# Saved VS Code names that start with a command are never typed back: should a keystroke miss the rename box, the shell would run it.
+# The shell is asked as a login, interactive one like VS Code starts, so aliases and functions count; one that cannot answer gets nothing typed.
+WORDS=(ls)
+i=0
+while app="$(plutil -extract "windows.$i.app" raw -o - "$LAYOUT" 2>/dev/null)"; do
+  if [[ "$app" == Code ]] && title="$(plutil -extract "windows.$i.title" raw -o - "$LAYOUT" 2>/dev/null)"; then
+    word=""
+    read -r word _ <<<"$title" || true
+    if [[ -n "$word" ]]; then WORDS+=("$word"); fi
+  fi
+  i=$((i + 1))
+done
+COMMANDS=""
+case "${LOGIN_SHELL##*/}" in
+  zsh|bash|sh|ksh)
+    COMMANDS="$("$LOGIN_SHELL" -lic 'for w in "$@"; do command -v -- "$w" >/dev/null 2>&1 && printf "CMD:%s\n" "$w"; done' _ "${WORDS[@]}" </dev/null 2>/dev/null | sed -n 's/^CMD://p' || true)" ;;
+esac
+printf '%s\n' "$COMMANDS" | /usr/bin/grep -qx ls || LOGIN_SHELL=""
 
-RESULT="$(osascript -l JavaScript - "$LAYOUT" <<'JXA'
+RESULT="$(osascript -l JavaScript - "$LAYOUT" "$UPDATED" "$BOOTED" "${LOGIN_SHELL##*/}" "$COMMANDS" <<'JXA'
 ObjC.import('Foundation')
 ObjC.import('CoreGraphics')
 ObjC.import('ApplicationServices')
@@ -165,12 +192,14 @@ function run(argv) {
   const raw = ObjC.unwrap(
     $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null)
   )
-  const saved = JSON.parse(raw).windows || []
+  const layout = JSON.parse(raw)
+  const saved = layout.windows || []
   if (saved.length === 0) return 'EMPTY'
+  const original = saved.map(e => Object.assign({}, e))
 
   const cid = $.CGSMainConnectionID()
   const se = Application('System Events')
-  let placed = 0, relocated = 0, missed = 0, denied = false, automation = false, switching = true
+  let placed = 0, relocated = 0, renamed = 0, lifted = 0, minimized = 0, missed = 0, denied = false, automation = false, switching = true
   const blocked = e => e.errorNumber === -1743 || /not authori[sz]ed to send apple events/i.test(String(e.message))
 
   // Every Space in Mission Control order; desktop is its 1-based number, null for full screen apps.
@@ -248,16 +277,27 @@ function run(argv) {
       const w = ObjC.deepUnwrap(list.objectAtIndex(i))
       if (w.kCGWindowLayer !== 0) continue
       const b = w.kCGWindowBounds
-      rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID, x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) })
+      rows.push({ num: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID, on: w.kCGWindowIsOnscreen === true,
+        x: Math.round(b.X), y: Math.round(b.Y), w: Math.round(b.Width), h: Math.round(b.Height) })
     }
     return rows
   }
   // Current bounds of a window number, or null once that window is closed.
   const cgBounds = num => cgList().find(r => r.num === num) || null
   const same = (a, b) => a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
-  const cgFind = (pid, g) => { const r = cgList().find(r => r.pid === pid && same(r, g)); return r ? r.num : null }
   const geom = w => { const p = w.position(), s = w.size(); return { x: p[0], y: p[1], w: s[0], h: s[1] } }
   const place = (w, g) => { w.position = [g.x, g.y]; w.size = [g.w, g.h] }
+  // System Events refers to a window by its title, so same-title windows would all read as the first: go by list position.
+  const winList = proc => { const n = proc.windows.length, list = []; for (let i = 0; i < n; i++) list.push(proc.windows[i]); return list }
+  // The front window of an app on screen; CG lists on-screen windows front to back.
+  function topWindow(pid) {
+    const list = ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1, 0))
+    for (let i = 0; i < list.count; i++) {
+      const w = ObjC.deepUnwrap(list.objectAtIndex(i))
+      if (w.kCGWindowLayer === 0 && w.kCGWindowOwnerPID === pid) return w.kCGWindowNumber
+    }
+    return null
+  }
   const label = e => `${e.app} ${e.id == null ? '' : '#' + e.id + ' '}${JSON.stringify(e.title)}`
   const where = g => `${g.x},${g.y} ${g.w}x${g.h}`
 
@@ -277,6 +317,22 @@ function run(argv) {
     if (!t && e.desktop != null) t = live.find(s => s.desktop === e.desktop)
     e.target = t ? t.id : null
     if (e.desktop != null && !t) console.log(`note ${label(e)} desktop ${e.desktop} no longer exists, placing only`)
+  }
+
+  // Window numbers restart after a reboot, so a number saved before the app last started may now belong to another window.
+  const savedAt = Date.parse(layout.savedAt), bootedAt = Number(argv[2]) * 1000
+  const savedId = new Map(saved.map(e => [e, e.id]))
+  const restarted = new Set()
+  for (const appName of new Set(saved.map(e => e.app))) {
+    let started
+    try {
+      const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(se.applicationProcesses.byName(appName).unixId())
+      started = app.isNil() || app.launchDate.isNil() ? bootedAt : app.launchDate.timeIntervalSince1970 * 1000
+    } catch (e) { continue }
+    if (!(started > savedAt)) continue
+    console.log(`${appName} started after this layout was saved, ignoring its saved window numbers`)
+    restarted.add(appName)
+    for (const e of saved) if (e.app === appName) e.id = null
   }
 
   // Visit the current desktop first, then every desktop that holds a saved window.
@@ -320,7 +376,8 @@ function run(argv) {
     const cur = cgBounds(num)
     if (!cur) return null
     let candidates
-    try { candidates = proc.windows().filter(w => { try { return same(geom(w), cur) } catch (e) { return false } }) } catch (e) { return null }
+    try { candidates = winList(proc).filter(w => { try { return same(geom(w), cur) } catch (e) { return false } }) } catch (e) { return null }
+    if (candidates.length > 1 && cur.on) candidates = candidates.filter(w => !isMinimized(w))
     if (candidates.length === 1) return candidates[0]
     for (const w of candidates) {
       try {
@@ -334,21 +391,72 @@ function run(argv) {
     return null
   }
 
+  // Brings AX window w up and returns the number that came up at spot g, or null; macOS shows it on the desktop it was
+  // minimized on after an animation of about 0.7 s.
+  function unminimize(pid, w, g) {
+    const shown = new Set(cgList().filter(r => r.on).map(r => r.num))
+    try {
+      const a = w.attributes.byName('AXMinimized')
+      if (!a.settable()) return null
+      a.value = false
+    } catch (e) { return null }
+    delay(0.7)
+    let last = null
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) {
+      const up = cgList().filter(r => r.pid === pid && r.on && !shown.has(r.num) && same(r, g))
+      const num = up.length === 1 ? up[0].num : null
+      if (num !== null && num === last) return num
+      last = num
+      delay(0.1)
+    }
+    return null
+  }
+
+  // A window minimized on its saved desktop comes back up there later, so it has to be on the current desktop.
+  function lower(proc, entry) {
+    let err = null
+    const here = [...new Set(live.map(s => s.display))].map(d => currentSpace(d))
+    const w = spacesOf(entry.id).some(s => here.includes(s)) ? axWindow(proc, entry.id) : null
+    if (!w) err = 'it is not on this desktop'
+    else {
+      try {
+        const a = w.attributes.byName('AXMinimized')
+        if (!a.settable()) err = 'it cannot be minimized'
+        else {
+          a.value = true
+          const deadline = Date.now() + 2000
+          while (Date.now() < deadline && (cgBounds(entry.id) || {}).on) delay(0.1)
+          if ((cgBounds(entry.id) || {}).on) err = 'it did not minimize'
+        }
+      } catch (e) { err = `minimizing failed: ${e.message}` }
+    }
+    if (err) { console.log(`left ${label(entry)} up: ${err}`); return }
+    minimized++
+    console.log(`minimized ${label(entry)}`)
+  }
+
+  const mouse = (type, x, y) => { const ev = $.CGEventCreateMouseEvent(null, type, { x: x, y: y }, 0); $.CGEventSetFlags(ev, 0); $.CGEventPost(0, ev) }
+
   // Hold the window by its title bar while ctrl+arrow switches desktops; macOS 14.5+ allows nothing else.
   function dragToDesktop(proc, entry, from) {
-    const w = axWindow(proc, entry.id)
-    if (!w) return `not found on ${deskLabel(from)}`
-    if (isMinimized(w)) return 'minimized'
+    const w0 = axWindow(proc, entry.id)
+    if (!w0) return `not found on ${deskLabel(from)}`
+    if (isMinimized(w0)) return 'minimized'
     try { if (!proc.visible()) unhidden.push(entry.app) } catch (e) {}
     try { proc.frontmost = true } catch (e) {}
-    try { w.actions.byName('AXRaise').perform() } catch (e) {}
+    try { w0.actions.byName('AXRaise').perform() } catch (e) {}
     delay(0.25)
+    // Raising reorders the window list, so look the window up again.
+    const w = axWindow(proc, entry.id)
+    if (!w) return 'lost track of it after raising it'
     const g = cgBounds(entry.id)
     if (!g) return 'window closed'
-    const pt = grabPoint(proc.unixId(), w, g)
+    let pid
+    try { pid = proc.unixId() } catch (e) { return 'its app quit' }
+    const pt = grabPoint(pid, w, g)
     if (!pt) return 'no free spot on its title bar'
     console.log(`  holding ${label(entry)} at ${pt.x},${pt.y} (${pt.role})`)
-    const mouse = (type, x, y) => { const ev = $.CGEventCreateMouseEvent(null, type, { x: x, y: y }, 0); $.CGEventSetFlags(ev, 0); $.CGEventPost(0, ev) }
     mouse(1, pt.x, pt.y); delay(0.08)
     mouse(6, pt.x + 1, pt.y); delay(0.08)
     const ok = gotoSpace(entry.target, true)
@@ -362,6 +470,78 @@ function run(argv) {
     const w2 = axWindow(proc, entry.id)
     if (w2) try { place(w2, entry) } catch (e) {}
     return null
+  }
+
+  const VSCODE = 'Code'
+  // What VS Code shows for a terminal nobody named: its shell, the status Claude Code sets, or a program version.
+  const unnamed = t => /^-?(zsh|bash|sh|fish|ksh|tcsh|csh|pwsh|nu)$/.test(t) || /^[✳◐◑] /u.test(t) || /^\d+(\.\d+)+$/.test(t)
+  const named = t => typeof t === 'string' && t.trim() !== '' && !unnamed(t)
+  // A title of the login shell itself means it waits at its prompt; any other shell name is a script running in it.
+  const loginShell = String(argv[3] || '')
+  const atPrompt = t => loginShell !== '' && (t === loginShell || t === '-' + loginShell)
+  const commands = new Set(String(argv[4] || '').split('\n').filter(Boolean))
+  // Plain characters only, none a shell acts on, so a name typed at the prompt by mistake is just an unknown command.
+  const plain = t => /^[A-Za-z0-9\u{80}-\u{10FFFF}][A-Za-z0-9 ._,:@#+\-\u{80}-\u{10FFFF}]*$/u.test(t) && !commands.has(t.trim().split(/\s+/)[0])
+  // A window of a folder workspace shows "name — folder", which is no terminal name to type back.
+  const typable = t => named(t) && !t.includes(' — ')
+  // VS Code opens its main window before any terminal window, so it holds the lowest number.
+  const mainId = Math.min(...saved.filter(e => e.app === VSCODE && savedId.get(e) != null).map(e => savedId.get(e)))
+
+  // The only spare at the saved spot of an entry first, then the rest in window order, trusted only when the counts match.
+  function pairUp(entries, spareList) {
+    const pairs = []
+    let es = [...entries], ss = [...spareList]
+    for (const e of [...es]) {
+      const hits = ss.filter(s => same(e, s))
+      if (hits.length !== 1 || es.filter(o => same(o, hits[0])).length !== 1) continue
+      pairs.push([e, hits[0], true])
+      es = es.filter(o => o !== e)
+      ss = ss.filter(o => o !== hits[0])
+    }
+    const sure = es.length === ss.length
+    es.forEach((e, i) => { if (i < ss.length) pairs.push([e, ss[i], sure]) })
+    return pairs
+  }
+
+  // Rename in VS Code acts on whichever terminal was last focused, so click into this one first.
+  // A keystroke that misses the Command Palette lands at the shell prompt, so only names that are no command get this far.
+  function renameTerminal(proc, pid, entry, w, title) {
+    try { if (!proc.visible()) unhidden.push(entry.app) } catch (e) {}
+    try { proc.frontmost = true } catch (e) {}
+    try { w.actions.byName('AXRaise').perform() } catch (e) {}
+    delay(0.3)
+    const g = cgBounds(entry.id)
+    if (!g) return 'window closed'
+    const x = g.x + Math.round(g.w / 2), y = g.y + Math.round(g.h / 2)
+    const el = elementAt(x, y)
+    if (!el || el.pid !== pid) return 'its middle is covered by another window'
+    console.log(`  renaming ${label(entry)} from ${JSON.stringify(title)}, clicking ${x},${y}`)
+    mouse(1, x, y); delay(0.05)
+    mouse(2, x, y); delay(0.3)
+    // Keystrokes go wherever focus is, so never type unless this exact window number is in front.
+    const focused = () => { try { return proc.frontmost() && topWindow(pid) === entry.id } catch (e) { return false } }
+    if (!focused()) return 'could not focus it'
+    try {
+      proc.menuBars[0].menuBarItems.byName('View').menus[0].menuItems.whose({ name: { _beginsWith: 'Command Palette' } })[0].click()
+    } catch (e) { return `could not open the Command Palette: ${e.message}` }
+    delay(0.8)
+    if (!focused()) return 'lost focus before opening Rename'
+    se.keystroke('Terminal: Rename...')
+    delay(0.5)
+    se.keyCode(36)
+    delay(0.8)
+    if (!focused()) return 'lost focus before typing the name'
+    // Bringing it to the front reordered the window list, so titles are read afresh; a twin at the spot may already show the name.
+    const showing = () => { try { return winList(proc).filter(v => { try { return same(geom(v), g) && v.name() === entry.title } catch (e) { return false } }).length } catch (e) { return 0 } }
+    const before = showing()
+    se.keystroke('a', { using: 'command down' })
+    se.keystroke(entry.title)
+    delay(0.2)
+    se.keyCode(36)
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) { if (showing() > before) return null; delay(0.1) }
+    if (focused()) se.keyCode(53)
+    return `its title did not change to ${JSON.stringify(entry.title)}`
   }
 
   const pending = new Set(saved)
@@ -383,7 +563,72 @@ function run(argv) {
     drags.push(entry)
   }
 
-  for (const space of visits) {
+  const spares = []
+  // Windows of this app here that no saved entry owns; they can stand in for saved windows that are gone.
+  function collectSpares(appName, pid, windows, taken, space, hidden) {
+    const owned = new Set(saved.map(e => e.id).filter(n => n != null))
+    // Only on-screen rows can be the up windows below; a minimized one at the same spot is off screen.
+    const rows = cgList().filter(r => r.pid === pid && (r.on || hidden) && !owned.has(r.num) && !spares.some(s => s.num === r.num) &&
+      (sp => sp.length === 1 && sp[0] === space)(spacesOf(r.num)))
+    for (let i = 0; i < windows.length && rows.length > 0; i++) {
+      if (taken.has(i) || isMinimized(windows[i])) continue
+      let g
+      try { g = geom(windows[i]) } catch (e) { continue }
+      const k = rows.findIndex(r => same(r, g))
+      if (k === -1) continue
+      const r = rows.splice(k, 1)[0]
+      let title = null
+      try { title = windows[i].name() } catch (e) {}
+      spares.push({ app: appName, num: r.num, space: space, title: title, x: r.x, y: r.y, w: r.w, h: r.h })
+      console.log(`spare ${appName} #${r.num} ${JSON.stringify(title)} ${where(r)}`)
+    }
+  }
+
+  // Saved minimized without a number while its app kept running: never a reason to hand it some other window.
+  const twinInDock = e => e.minimized === true && savedId.get(e) == null && !restarted.has(e.app)
+
+  function moreDesktops(seen) {
+    const pids = new Set()
+    for (const appName of new Set([...pending].filter(e => (e.id == null || !cgBounds(e.id)) && !twinInDock(e)).map(e => e.app))) {
+      if (notRunning.has(appName)) continue
+      try { pids.add(se.applicationProcesses.byName(appName).unixId()) } catch (e) {}
+    }
+    const held = new Set()
+    for (const r of cgList()) if (pids.has(r.pid)) { const sp = spacesOf(r.num); if (sp.length === 1) held.add(sp[0]) }
+    const more = live.filter(s => s.desktop && held.has(s.id) && !seen.has(s.id)).map(s => s.id)
+    if (more.length > 0) console.log(`looking for the rest on ${more.map(deskLabel).join(', ')}`)
+    return more
+  }
+
+  // Spares go out in the order the app opened its windows, the order a relaunched VS Code reopens them in.
+  function spareDesktops() {
+    const rank = e => savedId.get(e) == null ? Infinity : savedId.get(e)
+    const held = new Set()
+    for (const appName of new Set([...pending].map(e => e.app))) {
+      const want = [...pending].filter(e => e.app === appName && (e.id == null || !cgBounds(e.id)) && !twinInDock(e)).sort((a, b) => rank(a) - rank(b) || 0)
+      const have = spares.filter(s => s.app === appName && cgBounds(s.num)).sort((a, b) => a.num - b.num)
+      for (const [e, s, sure] of pairUp(want, have)) {
+        console.log(`${label(e)} gets spare #${s.num} ${JSON.stringify(s.title)}${sure ? '' : ' (a guess, the window counts differ)'}`)
+        e.id = s.num
+        e.spare = true
+        e.unsure = !sure
+        // A name waiting for a window that is gone without a restart does not pass to the newcomer.
+        if (!restarted.has(appName)) e.kept = false
+        held.add(s.space)
+      }
+    }
+    return live.filter(s => held.has(s.id)).map(s => s.id)
+  }
+
+  // Desktops with saved windows first, spares only once every desktop holding windows of the app was searched by title.
+  function* visitPlan() {
+    const seen = new Set()
+    for (const s of visits) { seen.add(s); yield s }
+    for (const s of moreDesktops(seen)) yield s
+    for (const s of spareDesktops()) yield s
+  }
+
+  for (const space of visitPlan()) {
     if (pending.size === 0 || !switching) break
     const display = byId.get(space).display
     if (currentSpace(display) !== space && !gotoSpace(space, false)) {
@@ -395,12 +640,15 @@ function run(argv) {
 
     for (const appName of new Set([...pending].map(e => e.app))) {
       if (notRunning.has(appName)) continue
+      // A drag for the previous app ends on the desktop it carried the window to.
+      if (currentSpace(display) !== space && !gotoSpace(space, false)) { switching = false; break }
       const entries = [...pending].filter(e => e.app === appName)
-      let proc, windows, pid
+      let proc, windows, pid, hidden = false
       try {
         proc = se.applicationProcesses.byName(appName)
-        windows = proc.windows()
+        windows = winList(proc)
         pid = proc.unixId()
+        hidden = !proc.visible()
       } catch (e) {
         if (/assistive access/i.test(e.message)) denied = true
         if (blocked(e)) automation = true
@@ -408,55 +656,198 @@ function run(argv) {
         continue
       }
 
+      const ownDesktop = num => { const sp = spacesOf(num); return sp.length === 1 && byId.get(sp[0]) && byId.get(sp[0]).desktop ? sp[0] : null }
+      // Exact title, for a window that is gone or never had a number; a VS Code shell or status title is shared by many terminals.
+      const byTitle = entry => entry.title !== null && (appName !== VSCODE || named(entry.title))
+      // The number of the one off-screen window of this app at spot g that belongs to this desktop and no other entry; null if not exactly one.
+      const offscreenAt = (entry, g) => {
+        const rs = cgList().filter(r => r.pid === pid && same(r, g) && !r.on && !saved.some(o => o !== entry && o.id === r.num) &&
+          (own => own === null || own === space)(ownDesktop(r.num)))
+        return rs.length === 1 ? rs[0].num : null
+      }
+      const minimizedNamed = title => windows.filter(v => { try { return isMinimized(v) && v.name() === title } catch (e) { return false } })
+      const minimizedAt = g => windows.filter(v => { try { return isMinimized(v) && same(geom(v), g) } catch (e) { return false } })
+      const sendBack = num => { const t = axWindow(proc, num); if (t) try { t.attributes.byName('AXMinimized').value = true } catch (e) {} }
+
+      // Windows saved up but minimized now come up first, so the window list below is read with them in place.
+      // Minimized windows are listed on every desktop but come back up only on their own, so that is where this happens.
+      for (const entry of hidden ? [] : entries) {
+        if (entry.minimized !== false) continue
+        let num = entry.id != null && cgBounds(entry.id) ? entry.id : null
+        let named1 = null
+        if (num === null) {
+          if (!byTitle(entry)) continue
+          const hits = minimizedNamed(entry.title)
+          if (hits.length > 1) entry.why = 'several minimized windows have its title'
+          if (hits.length !== 1) continue
+          try { num = offscreenAt(entry, geom(hits[0])) } catch (e) { num = null }
+          if (num === null) { entry.why = 'its minimized window could not be told apart from others at its spot'; continue }
+          named1 = hits[0]
+        }
+        const cur = cgBounds(num)
+        if (!cur || cur.on) continue
+        const own = ownDesktop(num)
+        if (own !== null && own !== space) continue
+        // A same-spot twin minimized on another desktop would come up over there, out of reach, so none is tried then.
+        if (!named1 && minimizedAt(cur).length !== cgList().filter(r => r.pid === pid && !r.on && same(r, cur) &&
+          (o => o === null || o === space)(ownDesktop(r.num))).length) {
+          entry.why = 'a minimized window at its spot belongs to another desktop'
+          continue
+        }
+        // Same-spot twins look alike to AX: bring them up in turn, keeping each that was saved up too, until this one shows.
+        let why = 'it did not come up'
+        const wrong = []
+        for (let tries = 0; tries < 4; tries++) {
+          const cands = named1 ? [named1] : minimizedAt(cur)
+          if (cands.length === 0) break
+          const up = unminimize(pid, cands[0], cur)
+          try { windows = winList(proc) } catch (e) {}
+          if (up === null) break
+          if (up === num) { why = null; break }
+          const other = saved.find(o => o.app === appName && o.id === up && pending.has(o))
+          if (other && other.minimized === false && !named1) {
+            other.lifted = true
+            lifted++
+            console.log(`brought ${label(other)} up from the Dock`)
+            continue
+          }
+          wrong.push(up)
+          why = 'another window at the same spot came up instead'
+          if (named1) break
+        }
+        // Twins that came up but belong in the Dock go back once this one is up or every try is spent.
+        wrong.forEach(sendBack)
+        if (wrong.length > 0) try { windows = winList(proc) } catch (e) {}
+        if (why) { entry.why = `could not bring it up from the Dock: ${why}`; continue }
+        entry.id = num
+        entry.lifted = true
+        lifted++
+        console.log(`brought ${label(entry)} up from the Dock`)
+      }
+
       const taken = new Set()
       const drags = []
+      const keep = (entry, i, how) => {
+        if (i !== -1) taken.add(i)
+        entry.down = true
+        pending.delete(entry); placed++
+        console.log(`placed ${label(entry)} kept minimized${how}`)
+      }
 
       for (const entry of entries) {
-        const current = entry.id == null ? null : cgBounds(entry.id)
+        let current = entry.id == null ? null : cgBounds(entry.id)
+        const how = (entry.spare ? ' [spare]' : '') + (entry.lifted ? ' [was minimized]' : '')
 
-        if (current) {
-          if (same(current, entry)) { settle(entry, 'already at', space, drags); continue }
-          // Several windows can share one spot after an unplug, so a move only counts once the
-          // window number itself is seen to leave it.
-          let verified = -1
-          for (let i = 0; i < windows.length && verified === -1; i++) {
-            if (taken.has(i)) continue
-            let g
-            try { g = geom(windows[i]) } catch (e) { continue }
-            if (!same(g, current)) continue
-            let ok = false
-            try {
-              place(windows[i], entry)
-              let after = cgBounds(entry.id)
-              if (after !== null && same(after, current)) { delay(0.05); after = cgBounds(entry.id) }
-              ok = after !== null && !same(after, current)
-            } catch (e) {}
-            if (ok) { verified = i; break }
-            try { place(windows[i], current) } catch (e) {}
+        if (!current) {
+          // Saved minimized without a number (a twin at its spot), it is in the Dock still if a minimized window sits there.
+          if (entry.minimized === true && savedId.get(entry) == null && !hidden) {
+            const k = windows.findIndex((w, i) => { try { return !taken.has(i) && isMinimized(w) && same(geom(w), entry) } catch (e) { return false } })
+            if (k !== -1) { keep(entry, k, ' [at its spot]'); continue }
           }
-          if (verified === -1) continue
-          taken.add(verified)
-          settle(entry, '->', space, drags)
+          // The window is gone or never had a number: exact title here, a spare only after every desktop.
+          if (!byTitle(entry)) continue
+          const target = windows.findIndex((w, i) => {
+            if (taken.has(i)) return false
+            try { return w.name() === entry.title } catch (e) { return false }
+          })
+          if (target === -1) continue
+          if (isMinimized(windows[target])) {
+            // One saved up was brought up above if it could be; one minimized at save time stays in the Dock.
+            if (entry.minimized === false) continue
+            try { entry.id = offscreenAt(entry, geom(windows[target])) } catch (e) { entry.id = null }
+            keep(entry, target, ' [by title]')
+            continue
+          }
+          try {
+            // Another window of the app may already sit at that spot, so take the number that just arrived there.
+            const was = same(geom(windows[target]), entry)
+            const before = new Set(cgList().filter(r => r.pid === pid && same(r, entry)).map(r => r.num))
+            place(windows[target], entry)
+            taken.add(target)
+            const atSpot = () => cgList().filter(r => r.pid === pid && same(r, entry))
+            let at = atSpot()
+            for (let k = 0; k < 5 && !was && at.every(r => before.has(r.num)); k++) { delay(0.1); at = atSpot() }
+            const arrived = at.filter(r => !before.has(r.num))
+            entry.id = arrived.length === 1 ? arrived[0].num : was && at.length === 1 ? at[0].num : null
+            settle(entry, '-> [by title]', space, drags)
+          } catch (e) {
+            pending.delete(entry)
+            missed++
+            console.log(`missed ${label(entry)} move failed: ${e.message}`)
+          }
           continue
         }
 
-        // The window is gone or never had a number: exact title only, never its slot in the list.
-        const target = windows.findIndex((w, i) => {
-          if (taken.has(i)) return false
-          try { return entry.title !== null && w.name() === entry.title } catch (e) { return false }
+        // A window off screen on another desktop waits for the visit to its own, the only place AX can reach it.
+        const own = ownDesktop(entry.id)
+        if (!current.on && own !== null && own !== space) continue
+        // Off screen on its own desktop means minimized, unless the whole app is hidden.
+        const lowered = current.on || hidden ? -1 : windows.findIndex((w, i) => {
+          if (taken.has(i) || !isMinimized(w)) return false
+          try { return same(geom(w), current) } catch (e) { return false }
         })
-        if (target === -1) continue
-        try {
-          place(windows[target], entry)
-          taken.add(target)
-          entry.id = cgFind(pid, entry)
-          settle(entry, '-> [by title]', space, drags)
-        } catch (e) {
-          pending.delete(entry)
-          missed++
-          console.log(`missed ${label(entry)} move failed: ${e.message}`)
+        if (lowered !== -1) {
+          if (entry.minimized !== false) keep(entry, lowered, how)
+          else if (!entry.why) entry.why = 'it is still minimized'
+          continue
+        }
+
+        if (same(current, entry)) { settle(entry, 'already at' + how, space, drags); continue }
+        // Several windows can share one spot after an unplug, so a move only counts once the
+        // window number itself is seen to leave it.
+        let verified = -1
+        for (let i = 0; i < windows.length && verified === -1; i++) {
+          if (taken.has(i)) continue
+          let g
+          try { g = geom(windows[i]) } catch (e) { continue }
+          if (!same(g, current) || isMinimized(windows[i])) continue
+          let ok = false
+          try {
+            place(windows[i], entry)
+            let after = cgBounds(entry.id)
+            if (after !== null && same(after, current)) { delay(0.05); after = cgBounds(entry.id) }
+            ok = after !== null && !same(after, current)
+          } catch (e) {}
+          if (ok) { verified = i; break }
+          try { place(windows[i], current) } catch (e) {}
+        }
+        if (verified === -1) continue
+        taken.add(verified)
+        settle(entry, '->' + how, space, drags)
+      }
+
+      if (entries.some(e => pending.has(e))) collectSpares(appName, pid, windows, taken, space, hidden)
+
+      if (appName === VSCODE) {
+        for (const entry of entries) {
+          if (pending.has(entry) || entry.down || entry.unsure || entry.id == null || !typable(entry.title)) continue
+          // Without a restart a renamed terminal keeps its name, so a shell title there is another tab, not a lost name.
+          if (!restarted.has(VSCODE) && !(entry.kept && !entry.spare)) continue
+          if (savedId.get(entry) === mainId) { console.log(`did not rename ${label(entry)}: it has the lowest saved number, taken for the main window`); continue }
+          const w = axWindow(proc, entry.id)
+          let title = null
+          if (w) try { title = w.name() } catch (e) {}
+          if (title === entry.title) { entry.kept = false; continue }
+          if (!loginShell || !plain(entry.title)) {
+            // Never typed, but still remembered for the next save.
+            entry.kept = restarted.has(VSCODE) || !!entry.kept
+            console.log(`did not rename ${label(entry)}: ${loginShell ? 'its name could run as a shell command' : 'could not ask the login shell which names are commands'}`)
+            continue
+          }
+          if (!w || isMinimized(w) || !atPrompt(title)) {
+            entry.kept = true
+            console.log(`did not rename ${label(entry)}: it shows ${JSON.stringify(title)}, not its shell prompt; restore again once it does`)
+            continue
+          }
+          const err = renameTerminal(proc, pid, entry, w, title)
+          entry.kept = err !== null
+          if (err) console.log(`did not rename ${label(entry)}: ${err}`)
+          else { renamed++; console.log(`renamed ${label(entry)}`) }
         }
       }
+
+      // Windows minimized at save time go back to the Dock from their saved desktop, so carried ones go after the move.
+      for (const entry of entries) if (entry.minimized && !entry.down && entry.id != null && !pending.has(entry) && !drags.includes(entry)) lower(proc, entry)
 
       for (const entry of drags) {
         if (!switching) break
@@ -464,15 +855,17 @@ function run(argv) {
         const err = dragToDesktop(proc, entry, space)
         if (err) console.log(`left ${label(entry)} on ${deskLabel(space)}: ${err}`)
         else { relocated++; console.log(`moved ${label(entry)} to ${deskLabel(entry.target)}`) }
+        if (entry.minimized) lower(proc, entry)
       }
     }
   }
 
   for (const entry of pending) {
     missed++
-    let why = 'window closed, no exact title match'
+    let why = 'window closed, no exact title match or spare window'
     if (notRunning.has(entry.app)) why = 'app not running'
-    else if (entry.id == null) why = 'no window number, no exact title match'
+    else if (entry.why) why = entry.why
+    else if (entry.id == null) why = 'no window number, no exact title match or spare window'
     else if (cgBounds(entry.id)) { const sp = spacesOf(entry.id); why = `could not be matched on ${sp.length === 1 ? deskLabel(sp[0]) : 'its desktop'}` }
     console.log(`missed ${label(entry)} ${why}`)
   }
@@ -480,7 +873,7 @@ function run(argv) {
   for (const space of home) if (switching && !gotoSpace(space, false)) console.log(`could not return to ${deskLabel(space)}`)
   $.CGWarpMouseCursorPosition(mouse0)
   for (const name of unhidden) try { se.applicationProcesses.byName(name).visible = false } catch (e) {}
-  if (front && relocated > 0) {
+  if (front) {
     try {
       const p = se.applicationProcesses.byName(front), pid = p.unixId()
       if (cgList().some(r => r.pid === pid && spacesOf(r.num).includes(home[0]))) p.frontmost = true
@@ -489,7 +882,31 @@ function run(argv) {
 
   if (automation) return 'AUTOMATION'
   if (denied) return 'DENIED'
-  return `restored ${placed} windows (${relocated} moved to another desktop), ${missed} could not be placed` +
+
+  const norm = n => n == null ? null : n
+  // A guessed spare is written back unmatched, so a guess never turns into a window number or a name to type.
+  const ids = saved.map(e => e.unsure ? null : norm(e.id))
+  const kept = saved.map(e => !!e.kept && !e.unsure)
+  const changed = ids.filter((n, i) => n !== norm(original[i].id) || kept[i] !== !!original[i].kept).length
+  // A fresh save time marks every number as current, so it is written only once no window is left half matched;
+  // a window of a restarted app that did not come back has no number left to keep anyway.
+  const unsettled = [...pending].filter(e => !(restarted.has(e.app) && e.id == null) && norm(e.id) !== norm(savedId.get(e))).length
+  if (changed > 0 && (unsettled > 0 || !switching)) console.log(`layout left as saved: ${unsettled} windows not matched for sure`)
+  else if (changed > 0) {
+    layout.savedAt = new Date().toISOString()
+    layout.windows = original.map((o, i) => {
+      o.id = ids[i]
+      // A VS Code terminal that could not be renamed is tried again next time, restart or not.
+      if (kept[i]) o.kept = true
+      else delete o.kept
+      return o
+    })
+    $(JSON.stringify(layout, null, 2)).writeToFileAtomicallyEncodingError(argv[1], false, $.NSUTF8StringEncoding, null)
+    console.log(`${changed} saved windows now point at the windows used`)
+  }
+
+  const also = [[renamed, 'renamed'], [lifted, 'brought up from the Dock'], [minimized, 'minimized']].filter(p => p[0] > 0).map(p => `, ${p[0]} ${p[1]}`).join('')
+  return `restored ${placed} windows (${relocated} moved to another desktop${also}), ${missed} could not be placed` +
     (switching ? '' : '; desktop switching failed, see above')
 }
 JXA
@@ -519,6 +936,12 @@ MSG
     exit 1 ;;
   *)
     printf '%s\n' "$RESULT"
+    if [[ -s "$UPDATED" ]]; then
+      STAMP="$(stat -f '%Sm' -t '%Y%m%d%H%M.%S' "$LAYOUT")"
+      cp "$UPDATED" "$LAYOUT"
+      touch -t "$STAMP" "$LAYOUT"
+      printf 'updated tag "%s" with the windows it used\n' "$TAG"
+    fi
     case "$RESULT" in *'desktop switching failed'*)
       cat >&2 <<'MSG'
 
